@@ -69,6 +69,8 @@ python calculate_95th_percentile.py --province 省份 --cp CP类型 --start-time
 | `--school` | `-sc` | 指定院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学 | 否 | - |
 | `--export-daily` |  | 导出每日95值，而不是整个周期的汇总95值。当使用此参数时，输出文件将包含每日数据，且不提供控制台汇总统计。 | 否 | False (开关参数) |
 | `--exclude-school` | `-esc` | 排除的院校名称，多个院校用逗号分隔。将对“排除名单院校”（逐校）与“剩余院校”（整体汇总）分别计算并分别输出。剩余院校会先在每个时间点上把 recv/send 求和后再计算95值。 | 否 | - |
+| `--sortby` |  | 按该字段排序输出，例如：95th_percentile_mbps、daily_95th_percentile_mbps、ipgroup_name 等 | 否 | - |
+| `--sort-order` |  | 排序顺序：asc（升序）或 desc（降序） | 否 | desc |
 
 ### 示例
 
@@ -111,15 +113,29 @@ python calculate_95th_percentile.py \
 - `四川省-教育网_excluded.csv`：只包含“电子科技大学、四川大学”的逐校计算结果。
 - `四川省-教育网_remaining.csv`：包含“剩余院校汇总”的计算结果（非逐校）。周期模式下一般仅一行；每日模式下为按天多行。
 
+7. 周期模式下按95值从高到低排序输出：
+```bash
+python calculate_95th_percentile.py --province 山东省 --cp bilibili \
+  --start-time "2025-03-18 00:00:00" --end-time "2025-03-25 23:59:59" \
+  --sortby 95th_percentile_mbps --sort-order desc
+```
+
+8. 每日模式下按“每日95值”从低到高排序输出：
+```bash
+python calculate_95th_percentile.py --province 湖北省 --cp 腾讯云 \
+  --start-time "2025-04-01 00:00:00" --end-time "2025-04-07 23:59:59" \
+  --export-daily --sortby daily_95th_percentile_mbps --sort-order asc
+```
+
 ## 输出结果
 
-工具会将计算结果保存到CSV文件中。输出格式取决于是否使用了 `--export-daily` 参数，以及是否使用了 `--exclude-school` 参数。
+工具会将计算结果保存到CSV文件中。输出格式取决于是否使用了 `--export-daily` 参数，以及是否使用了 `--exclude-school` 参数。若指定了 `--sortby`，将在写入前按该字段进行排序，顺序由 `--sort-order` 控制。
 
 **当计算周期汇总95值时 (默认行为):**
 
 CSV文件包含以下字段：
 - school_id：院校ID
-- school_name：院校名称
+- ipgroup_name：院校名称（IP组名称）
 - ipgroup_id：IP组ID
 - nfa_uuid：NFA UUID
 - 95th_percentile_mbps：整个周期的95值（Mbps）
@@ -139,7 +155,7 @@ CSV文件包含以下字段：
 
 CSV文件包含以下字段：
 - school_id：院校ID
-- school_name：院校名称
+- ipgroup_name：院校名称（IP组名称）
 - ipgroup_id：IP组ID
 - nfa_uuid：NFA UUID
 - date：日期 (YYYY-MM-DD)
@@ -168,3 +184,6 @@ CSV文件包含以下字段：
 2. 确保数据库中有对应的数据表和访问权限
 3. 如果未找到符合条件的院校或流速数据，工具会给出相应的警告信息
 4. 自 版本更新 起，程序默认过滤 `nfa_ipgroup.type='yuanxiao'`，排除 `dianbo`（点播）与 `zhibo`（直播）
+5. 当某院校在所选时间范围内没有任何流量数据点：
+   - 周期汇总模式（默认）：该院校将被跳过，不会写入一条 95 值为 0 的记录。
+   - 每日导出模式：对没有数据的日期或院校也会跳过写入，对有数据的日期正常计算与输出。

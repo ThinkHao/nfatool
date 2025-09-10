@@ -38,6 +38,8 @@ def parse_args():
     parser.add_argument('--school', '-sc', help='指定院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学')
     parser.add_argument('--export-daily', action='store_true', help='导出每日95值，而不是整个周期的汇总95值')
     parser.add_argument('--exclude-school', '-esc', help='排除的院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学')
+    parser.add_argument('--sortby', help='按该字段排序输出，例如：95th_percentile_mbps、daily_95th_percentile_mbps、ipgroup_name 等')
+    parser.add_argument('--sort-order', choices=['asc', 'desc'], default='desc', help='排序顺序：asc（升序）或 desc（降序），默认 desc')
     return parser.parse_args()
 
 def load_db_config(config_file):
@@ -241,16 +243,7 @@ def process_schools(connection, schools, start_time, end_time, direction, export
                 end_time
             )
             if not speed_data:
-                logger.warning(f"未找到院校 {school['ipgroup_name']} (ID: {school['school_id']}) 在指定时间范围内的流速数据")
-                results.append({
-                    'school_id': school['school_id'],
-                    'ipgroup_name': school['ipgroup_name'],
-                    'ipgroup_id': school['ipgroup_id'],
-                    'nfa_uuid': school['nfa_uuid'],
-                    '95th_percentile_mbps': 0,
-                    'data_points': 0,
-                    'direction': direction
-                })
+                logger.warning(f"未找到院校 {school['ipgroup_name']} (ID: {school['school_id']}) 在指定时间范围内的流速数据，已跳过写入。")
                 continue
 
             percentile_95 = calculate_95th_percentile(speed_data, direction)
@@ -317,11 +310,22 @@ def aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time):
         logger.error(f"数据库端聚合剩余院校失败: {e}")
         return pd.DataFrame()
 
-def save_results(results, output_path, is_daily, direction, start_time, end_time, extra_log_prefix=""):
+def save_results(results, output_path, is_daily, direction, start_time, end_time, extra_log_prefix="", sort_by=None, sort_order='desc'):
     if not results:
         logger.warning(f"{extra_log_prefix}没有计算任何结果，跳过写入文件。")
         return
     df_final_results = pd.DataFrame(results)
+    # 如需排序则按指定字段排序
+    if sort_by:
+        if sort_by in df_final_results.columns:
+            ascending = (sort_order == 'asc')
+            try:
+                df_final_results = df_final_results.sort_values(by=sort_by, ascending=ascending)
+                logger.info(f"{extra_log_prefix}已按字段 '{sort_by}' 进行{'升序' if ascending else '降序'}排序。")
+            except Exception as e:
+                logger.warning(f"{extra_log_prefix}按字段 '{sort_by}' 排序失败：{e}，将保持原顺序。")
+        else:
+            logger.warning(f"{extra_log_prefix}指定的排序字段 '{sort_by}' 不存在，将保持原顺序。可用字段：{', '.join(df_final_results.columns)}")
     df_final_results.to_csv(output_path, index=False, encoding='utf-8-sig')
     if is_daily:
         logger.info(f"{extra_log_prefix}每日95值结果已保存到 {output_path}")
@@ -387,7 +391,7 @@ def main():
             if excluded_schools:
                 logger.info(f"将对排除院校单独计算，共 {len(excluded_schools)} 所。名单: {', '.join(sorted(exclude_set))}")
                 results_excluded = process_schools(connection, excluded_schools, start_time, end_time, args.direction, args.export_daily)
-                save_results(results_excluded, out_excluded, args.export_daily, args.direction, start_time, end_time, extra_log_prefix="[排除组] ")
+                save_results(results_excluded, out_excluded, args.export_daily, args.direction, start_time, end_time, extra_log_prefix="[排除组] ", sort_by=args.sortby, sort_order=args.sort_order)
             else:
                 logger.warning("未在查询结果中找到需要排除并单独计算的院校，跳过排除组计算。")
 
@@ -448,7 +452,7 @@ def main():
                                 'direction': args.direction,
                                 'data_points_daily': len(group)
                             })
-                        save_results(results_remaining, out_remaining, True, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ")
+                        save_results(results_remaining, out_remaining, True, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
                     else:
                         val = calculate_95th_percentile(df_agg.to_dict('records'), args.direction)
                         results_remaining = [{
@@ -460,16 +464,16 @@ def main():
                             'data_points': len(df_agg),
                             'direction': args.direction
                         }]
-                        save_results(results_remaining, out_remaining, False, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ")
+                        save_results(results_remaining, out_remaining, False, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
             else:
                 logger.warning("排除后无剩余院校可计算，跳过剩余组计算。")
         else:
             # 保持原有单组处理逻辑（逐校）
             results = process_schools(connection, schools, start_time, end_time, args.direction, args.export_daily)
             if args.export_daily:
-                save_results(results, args.output, True, args.direction, start_time, end_time)
+                save_results(results, args.output, True, args.direction, start_time, end_time, sort_by=args.sortby, sort_order=args.sort_order)
             else:
-                save_results(results, args.output, False, args.direction, start_time, end_time)
+                save_results(results, args.output, False, args.direction, start_time, end_time, sort_by=args.sortby, sort_order=args.sort_order)
                 logger.info("汇总信息:")
                 logger.info(f"  省份: {args.province}")
                 logger.info(f"  CP类型: {args.cp}")
