@@ -2,5 +2,16 @@
 /sql
 /txt
 *.ini
+*.txt
 .DS_Store
 *.csv
+__pycache__
+log/
+storage/
+# Server runtime artifacts and env
+/server/storage/
+/server/logs/
+/server/.env
+
+# Allow requirements.txt under server
+!server/requirements.txt

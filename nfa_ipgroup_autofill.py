@@ -4,14 +4,18 @@
 按规则自动补全 nfa_ipgroup 表中新增记录的字段：
 - check_status 填 0
 - type 填 "yuanxiao"
-- nfa_name: 优先同 nfa_uuid 的历史记录沿用；否则回退命令行参数；都没有留空
+- nfa_name: 仅按 nfa_uuid 的历史记录沿用；若无历史值则留空并提示人工处理
 - ipgroup_name: 解析格式 "院校名称_CP名称_IP版本"（兼容 V4/V6 及 V4-1/V6-2，含中英文短横），
   填充 school_name、cp（根据 mapping.json 将显示名映射为简称）
-- region: 优先使用命令行参数；否则同 nfa_uuid 的历史记录沿用；否则留空
+- region: 优先使用命令行参数；否则基于 school_name 的历史记录沿用；否则留空
 - school_id: 根据 school_name 在历史记录中沿用（取最近的非空值）
 - saler_group / saler: 根据 school_name 在历史记录中沿用；否则回退命令行参数；都没有留空
 
 支持 dry-run 预览以及通过 --nfa-uuid 参数限制操作范围（可逗号分隔多个）。
+
+默认对“字段已完整”的记录跳过处理（不做任何写入），仅在提供 --override 时才强制应用规则更新。
+
+默认过滤 is_server=1 的条目（这些条目不在脚本填充范围内）。
 """
 
 import argparse
@@ -138,8 +142,8 @@ def fetch_existing_from_nfa_uuid(cursor, nfa_uuid: str) -> Dict:
         SELECT nfa_name, region, type
         FROM nfa_ipgroup
         WHERE nfa_uuid=%s
-          AND (nfa_name IS NOT NULL OR region IS NOT NULL OR type IS NOT NULL)
-        ORDER BY update_time DESC, create_time DESC
+          AND (nfa_name IS NOT NULL OR region IS NOT NULL)
+        ORDER BY (nfa_name IS NULL) ASC, update_time DESC, create_time DESC
         LIMIT 1
         """,
         (nfa_uuid,)
@@ -162,6 +166,21 @@ def fetch_school_id_by_name(cursor, school_name: str) -> Optional[int]:
     return row['school_id'] if row else None
 
 
+def fetch_region_by_school(cursor, school_name: str) -> Optional[str]:
+    cursor.execute(
+        """
+        SELECT region
+        FROM nfa_ipgroup
+        WHERE school_name=%s AND region IS NOT NULL AND type='yuanxiao' AND (is_server IS NULL OR is_server=0)
+        ORDER BY update_time DESC, create_time DESC
+        LIMIT 1
+        """,
+        (school_name,)
+    )
+    row = cursor.fetchone()
+    return row['region'] if row else None
+
+
 def fetch_saler_by_school(cursor, school_name: str) -> Tuple[Optional[str], Optional[str]]:
     cursor.execute(
         """
@@ -176,6 +195,31 @@ def fetch_saler_by_school(cursor, school_name: str) -> Tuple[Optional[str], Opti
     row = cursor.fetchone() or {}
     return row.get('saler_group'), row.get('saler')
 
+# -------------------- 完整性判断 --------------------
+
+def _is_nonempty(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ''
+    return True
+
+def is_row_complete(row: Dict) -> bool:
+    """判断该条记录关键字段是否已完整。
+    关键字段：nfa_name, school_name, cp, region, school_id, saler_group, saler。
+    注：type/check_status 不纳入“完整性”判断，避免对已成型数据做无谓改动。
+    """
+    required_keys = ['nfa_name', 'school_name', 'cp', 'region', 'school_id', 'saler_group', 'saler']
+    for k in required_keys:
+        v = row.get(k)
+        if k == 'school_id':
+            if v is None:
+                return False
+        else:
+            if not _is_nonempty(v):
+                return False
+    return True
+
 # -------------------- 主处理逻辑 --------------------
 
 def build_select_sql(nfa_uuid_list: List[str]) -> Tuple[str, Tuple]:
@@ -185,12 +229,14 @@ def build_select_sql(nfa_uuid_list: List[str]) -> Tuple[str, Tuple]:
         "FROM nfa_ipgroup"
     )
     params: List = []
+    server_filter = "(is_server IS NULL OR is_server=0)"
     if nfa_uuid_list:
         placeholders = ','.join(['%s'] * len(nfa_uuid_list))
-        where = f" WHERE nfa_uuid IN ({placeholders})"
+        where = f" WHERE nfa_uuid IN ({placeholders}) AND {server_filter}"
         return base + where, tuple(nfa_uuid_list)
     else:
-        return base, tuple()
+        where = f" WHERE {server_filter}"
+        return base + where, tuple()
 
 
 def compute_updates_for_row(row: Dict,
@@ -232,24 +278,22 @@ def compute_updates_for_row(row: Dict,
         else:
             empty_fields.append('cp')  # 无法从 ipgroup_name 解析
 
-    # region：优先命令行，其次历史同 nfa_uuid
+    # region：优先命令行，其次历史
     if not row.get('region'):
         if args.region:
             updates['region'] = args.region
+            if getattr(args, 'trace_source', False):
+                logger.info(f"region来源[CLI参数] id={row.get('id')} -> '{args.region}'")
         else:
             # 历史沿用
             # 在 compute_updates_for_row 之外无法直接访问 cursor，这里放到调用处补齐；
             # 为保持单函数职责，这里先做占位，由调用者完成。
             pass
 
-    # nfa_name：优先 nfa_uuid 历史，其次命令行
+    # nfa_name：仅按 nfa_uuid 历史；若无历史值则留空
     if not row.get('nfa_name'):
-        if args.nfa_name:
-            # 临时先用参数，若稍后能查到历史值，调用方会覆盖
-            updates['nfa_name'] = args.nfa_name
-        else:
-            # 留空占位，调用方若查不到历史值会把字段记录为空
-            empty_fields.append('nfa_name')
+        # 留空占位，调用方若查不到历史值会把字段记录为空
+        empty_fields.append('nfa_name')
 
     # school_id：根据 school_name 历史沿用
     if not row.get('school_id') and (row.get('school_name') or parsed_school_name):
@@ -274,27 +318,40 @@ def compute_updates_for_row(row: Dict,
 def apply_historical_overrides(cursor, row: Dict, updates: Dict[str, object], empty_fields: List[str], args):
     """根据历史记录（nfa_uuid、school_name）进一步完善 region / nfa_name / school_id / saler*"""
     nfa_uuid = row.get('nfa_uuid')
-    school_name = updates.get('school_name') or row.get('school_name')
+    # 优先使用从 ipgroup_name 解析出的 school_name 作为后续 region 查找依据
+    parsed_school_name, _, _ = parse_ipgroup_name(row.get('ipgroup_name'))
+    school_name = updates.get('school_name') or parsed_school_name or row.get('school_name')
 
-    # nfa_uuid 历史：region / nfa_name
+    # nfa_uuid 历史：nfa_name（region 不再使用 nfa_uuid）
     if nfa_uuid:
         hist = fetch_existing_from_nfa_uuid(cursor, nfa_uuid)
-        # region：若当前仍为空，且命令行未指定，则用历史
-        if (not row.get('region')) and ('region' not in updates) and hist.get('region') and not args.region:
-            updates['region'] = hist['region']
-            if 'region' in empty_fields:
-                try:
-                    empty_fields.remove('region')
-                except ValueError:
-                    pass
+        # 若当前 nfa_name 为空且历史有值，则优先用历史覆盖
+        # region 不再从 nfa_uuid 沿用，改为后续统一按 school 历史查找
         # nfa_name：若当前为空且历史有值，则优先用历史覆盖（高于命令行参数）
         if (not row.get('nfa_name')) and hist.get('nfa_name'):
             updates['nfa_name'] = hist['nfa_name']
+            if getattr(args, 'trace_source', False):
+                logger.info(f"nfa_name来源[nfa_uuid历史] id={row.get('id')} nfa_uuid={nfa_uuid} -> '{hist['nfa_name']}'")
             if 'nfa_name' in empty_fields:
                 try:
                     empty_fields.remove('nfa_name')
                 except ValueError:
                     pass
+
+    # region：若当前仍为空且未指定命令行参数，则基于 school_name 的历史沿用
+    if (not row.get('region')) and ('region' not in updates) and school_name and not args.region:
+        r = fetch_region_by_school(cursor, school_name)
+        if r:
+            updates['region'] = r
+            if getattr(args, 'trace_source', False):
+                logger.info(f"region来源[school历史] id={row.get('id')} school='{school_name}' -> '{r}'")
+            if 'region' in empty_fields:
+                try:
+                    empty_fields.remove('region')
+                except ValueError:
+                    pass
+
+    # 不再进行 school/cp/region 维度的猜测，nfa_name 仅按 nfa_uuid 历史沿用
 
     # school_id：按 school_name 历史沿用
     if (not row.get('school_id')) and school_name:
@@ -371,6 +428,13 @@ def run(args):
     empties_summary: List[Tuple[int, str, List[str]]] = []  # (id, ipgroup_name, [fields])
 
     for row in rows:
+        # 若未开启 override，则对字段完整的条目直接跳过
+        if not args.override and is_row_complete(row):
+            if getattr(args, 'trace_source', False):
+                logger.info(f"跳过(完整) id={row['id']} ipgroup='{row.get('ipgroup_name')}' nfa_name='{row.get('nfa_name')}'")
+            else:
+                logger.info(f"跳过 id={row['id']} ipgroup='{row.get('ipgroup_name')}'（关键字段已完整）")
+            continue
         updates, empty_fields = compute_updates_for_row(row, cp_mapping, args)
         # 用历史数据进行二次填充
         apply_historical_overrides(cursor, row, updates, empty_fields, args)
@@ -424,6 +488,8 @@ def run(args):
             # dry-run 日志
             change_items = [f"{k}: '{row.get(k)}' -> '{v}'" for k, v in updates.items()]
             logger.info(f"[dry-run] id={row['id']} ipgroup='{row.get('ipgroup_name')}' 将更新: " + "; ".join(change_items))
+            if getattr(args, 'trace_source', False) and 'nfa_name' in updates:
+                logger.info(f"    ↳ nfa_name来源: nfa_uuid历史")
 
     # 提交并收尾
     if args.execute and total_updates > 0:
@@ -450,9 +516,11 @@ def main():
     parser.add_argument('--mapping', default='mapping.json', help='CP映射文件路径（显示名->简称）')
     parser.add_argument('--nfa-uuid', dest='nfa_uuid', default=None, help='限制操作范围的 nfa_uuid，可逗号分隔多个')
     parser.add_argument('--region', default=None, help='用于填充 region 的参数。若未提供则尝试沿用同 nfa_uuid 的历史记录')
-    parser.add_argument('--nfa-name', dest='nfa_name', default=None, help='用于回退填充 nfa_name 的参数（历史不存在时使用）')
+    # 移除 --nfa-name 回退参数，nfa_name 仅按 nfa_uuid 历史沿用
     parser.add_argument('--saler-group', dest='saler_group', default=None, help='用于回退填充 saler_group 的参数（历史不存在时使用）')
     parser.add_argument('--saler', dest='saler', default=None, help='用于回退填充 saler 的参数（历史不存在时使用）')
+    parser.add_argument('--override', action='store_true', help='当记录关键字段已完整时，仍强制应用规则进行更新')
+    parser.add_argument('--trace-source', dest='trace_source', action='store_true', help='输出字段填充来源的调试信息（便于排查为何未命中历史）')
     parser.add_argument('--execute', action='store_true', help='实际执行更新。不加此参数则为 dry-run 预览')
 
     args = parser.parse_args()

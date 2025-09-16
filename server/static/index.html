@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NFA 95th 服务</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+</head>
+<body>
+  <div id="app">
+    <h1>NFA 95th 服务</h1>
+
+    <section>
+      <h2>健康检查</h2>
+      <button @click="checkHealth">检查</button>
+      <span>{{ health }}</span>
+    </section>
+
+    <section>
+      <h2>任务管理</h2>
+      <div class="row">
+        <input v-model="apiKey" placeholder="X-API-KEY" />
+        <button @click="loadTasks">刷新任务列表</button>
+      </div>
+
+      <div class="row">
+        <input v-model="newTask.name" placeholder="任务名" />
+        <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
+        <label>
+          任务类型：
+          <select v-model="newTask.kind">
+            <option value="one_off">一次性</option>
+            <option value="periodic">周期性</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" v-if="newTask.kind==='periodic'">
+        <label>
+          调度类型：
+          <select v-model="newTask.schedule_type">
+            <option :value="null">选择类型</option>
+            <option value="cron">cron</option>
+            <option value="interval">interval(秒)</option>
+            <option value="weekly_preset">weekly_preset(每周一)</option>
+          </select>
+        </label>
+        <input v-if="newTask.schedule_type==='cron'" v-model="newTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
+        <input v-if="newTask.schedule_type==='interval'" v-model.number="newTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
+        <input v-if="newTask.schedule_type==='weekly_preset'" v-model="newTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
+        <input v-model="newTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
+      </div>
+      <div class="row">
+        <span style="margin-right:6px;">时间范围：</span>
+        <select v-model="newTask.window_selector">
+          <option value="custom">自定义</option>
+          <option value="last_week">上一周</option>
+          <option value="last_n_days">最后N天</option>
+        </select>
+        <input v-if="newTask.window_selector==='last_n_days'" v-model.number="newTask.window_params.n" type="number" min="1" placeholder="N(天)" />
+        <input v-if="newTask.window_selector==='custom'" v-model="newTask.window_params.start_time" placeholder="开始时间 YYYY-MM-DD HH:MM:SS" />
+        <input v-if="newTask.window_selector==='custom'" v-model="newTask.window_params.end_time" placeholder="结束时间 YYYY-MM-DD HH:MM:SS" />
+      </div>
+      <div class="row">
+        <span style="margin-right:6px;">匹配条件：</span>
+        <input v-model="newTask.params.province" placeholder="省份，如四川省" />
+        <input v-model="newTask.params.cp" placeholder="CP，如bilibili" />
+        <select v-model="newTask.params.direction">
+          <option value="both">both</option>
+          <option value="recv">recv</option>
+          <option value="send">send</option>
+        </select>
+        <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
+        <input v-model="newTask.params.school" placeholder="指定院校(逗号分隔)" />
+        <input v-model="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+        <input v-model="newTask.params.sortby" placeholder="排序字段" />
+        <select v-model="newTask.params.sort_order">
+          <option value="desc">desc</option>
+          <option value="asc">asc</option>
+        </select>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" value="csv" v-model="newTask.export_formats" /> CSV</label>
+        <label><input type="checkbox" value="xlsx" v-model="newTask.export_formats" /> XLSX</label>
+        <input v-model="newTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
+        <button @click="createTask">创建任务</button>
+      </div>
+      <div class="row" style="margin-top:-8px; color:#666; font-size: 12px;">
+        可用占位符：{province}、{cp}、{direction}、{window}、{date}。示例：{province}-{cp}-{direction}-{window}.csv
+      </div>
+      <div class="row" style="margin-top:-8px; color:#333; font-size: 12px;">
+        文件名预览：{{ filenamePreview(newTask) }}
+      </div>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th><th>名称</th><th>启用</th><th>窗口</th><th>任务类型</th><th>调度</th><th>下次运行</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="t in tasks" :key="t.id">
+            <td>{{ t.id }}</td>
+            <td>{{ t.name }}</td>
+            <td>{{ t.active ? '是' : '否' }}</td>
+            <td>{{ t.window_selector }}</td>
+            <td>{{ t.kind === 'periodic' ? '周期性' : '一次性' }}</td>
+            <td>{{ scheduleSummary(t) }}</td>
+            <td>{{ formatDateTime(t.next_run_time) }}</td>
+            <td>
+              <button @click="toggleActive(t)">{{ t.active ? '暂停' : '启用' }}</button>
+              <button @click="startEdit(t)">编辑</button>
+              <button @click="runTask(t.id)">立即运行</button>
+              <button @click="viewRuns(t.id)">查看运行</button>
+              <button @click="removeTask(t.id)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section v-if="editTask">
+      <h2>编辑任务</h2>
+      <div class="row">
+        <input v-model="editTask.name" placeholder="任务名" />
+        <label><input type="checkbox" v-model="editTask.active" /> 启用</label>
+        <label>
+          任务类型：
+          <select v-model="editTask.kind">
+            <option value="one_off">一次性</option>
+            <option value="periodic">周期性</option>
+          </select>
+        </label>
+      </div>
+      <div class="row" v-if="editTask.kind==='periodic'">
+        <label>
+          调度类型：
+          <select v-model="editTask.schedule_type">
+            <option :value="null">选择类型</option>
+            <option value="cron">cron</option>
+            <option value="interval">interval(秒)</option>
+            <option value="weekly_preset">weekly_preset(每周一)</option>
+          </select>
+        </label>
+        <input v-if="editTask.schedule_type==='cron'" v-model="editTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
+        <input v-if="editTask.schedule_type==='interval'" v-model.number="editTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
+        <input v-if="editTask.schedule_type==='weekly_preset'" v-model="editTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
+        <input v-model="editTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
+      </div>
+      <div class="row">
+        <span style="margin-right:6px;">时间范围：</span>
+        <select v-model="editTask.window_selector">
+          <option value="custom">自定义</option>
+          <option value="last_week">上一周</option>
+          <option value="last_n_days">最后N天</option>
+        </select>
+        <input v-if="editTask.window_selector==='last_n_days'" v-model.number="editTask.window_params.n" type="number" min="1" placeholder="N(天)" />
+        <input v-if="editTask.window_selector==='custom'" v-model="editTask.window_params.start_time" placeholder="开始时间 YYYY-MM-DD HH:MM:SS" />
+        <input v-if="editTask.window_selector==='custom'" v-model="editTask.window_params.end_time" placeholder="结束时间 YYYY-MM-DD HH:MM:SS" />
+      </div>
+      <div class="row">
+        <span style="margin-right:6px;">匹配条件：</span>
+        <input v-model="editTask.params.province" placeholder="省份，如四川省" />
+        <input v-model="editTask.params.cp" placeholder="CP，如bilibili" />
+        <select v-model="editTask.params.direction">
+          <option value="both">both</option>
+          <option value="recv">recv</option>
+          <option value="send">send</option>
+        </select>
+        <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
+        <input v-model="editTask.params.school" placeholder="指定院校(逗号分隔)" />
+        <input v-model="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+        <input v-model="editTask.params.sortby" placeholder="排序字段" />
+        <select v-model="editTask.params.sort_order">
+          <option value="desc">desc</option>
+          <option value="asc">asc</option>
+        </select>
+      </div>
+      <div class="row">
+        <label><input type="checkbox" value="csv" v-model="editTask.export_formats" /> CSV</label>
+        <label><input type="checkbox" value="xlsx" v-model="editTask.export_formats" /> XLSX</label>
+        <input v-model="editTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
+        <button @click="saveEdit">保存</button>
+        <button @click="cancelEdit">取消</button>
+      </div>
+      <div class="row" style="margin-top:-8px; color:#666; font-size: 12px;">
+        可用占位符：{province}、{cp}、{direction}、{window}、{date}。示例：{province}-{cp}-{direction}-{window}.csv
+      </div>
+      <div class="row" style="margin-top:-8px; color:#333; font-size: 12px;">
+        文件名预览：{{ filenamePreview(editTask) }}
+      </div>
+    </section>
+
+    <section>
+      <h2>运行记录</h2>
+      <button @click="loadRuns()">刷新</button>
+      <table class="table">
+        <thead>
+          <tr>
+            <th>ID</th><th>任务ID</th><th>状态</th><th>开始</th><th>结束</th><th>产物</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in runs" :key="r.id">
+            <td>{{ r.id }}</td>
+            <td>{{ r.task_id }}</td>
+            <td>{{ r.status }}</td>
+            <td>{{ r.started_at }}</td>
+            <td>{{ r.finished_at }}</td>
+            <td>
+              <a v-for="a in r.artifacts" :key="a.filename" :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(a.filename)" target="_blank">{{ a.filename }}</a>
+            </td>
+            <td>
+              <button @click="deleteRun(r.id)">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </div>
+  <script src="/static/app.js?v=20250915-01"></script>
+</body>
+</html>
