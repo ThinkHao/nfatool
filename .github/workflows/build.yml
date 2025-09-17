@@ -39,8 +39,15 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          chmod +x server/build.sh
-          ./server/build.sh nfa95
+          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail;
+              export PATH="/opt/python/cp311-cp311/bin:$PATH";
+              python -m pip install --upgrade pip;
+              python -m pip install -r server/requirements.txt pyinstaller;
+              chmod +x server/build.sh;
+              ./server/build.sh nfa95;
+            '
 
       - name: Upload Artifact (Windows)
         if: runner.os == 'Windows'
