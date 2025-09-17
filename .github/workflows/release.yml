@@ -75,9 +75,7 @@ jobs:
               export PATH="/opt/python/cp311-shared/bin:$PATH";
               export LD_LIBRARY_PATH="/opt/python/cp311-shared/lib:${OPENSSL_DIR}/lib:$LD_LIBRARY_PATH";
               # Verify SSL
-              python3 - <<'PY'
-import ssl; import sys; print('Python:', sys.version); print('OpenSSL:', ssl.OPENSSL_VERSION)
-PY
+              python3 -c "import ssl,sys; print('Python:', sys.version); print('OpenSSL:', ssl.OPENSSL_VERSION)"
               cd /src;
               python3 -m pip install --upgrade pip;
               python3 -m pip install -r server/requirements.txt pyinstaller;
