@@ -320,7 +320,8 @@ async def list_jobs(task_id: Optional[int] = Query(default=None)):
         q = s.query(JobRun)
         if task_id is not None:
             q = q.filter(JobRun.task_id == task_id)
-        rows = q.order_by(JobRun.started_at.desc().nullslast()).limit(200).all()
+        # SQLite 不支持 NULLS LAST 语法，这里改为先按 IS NULL 升序，再按时间降序，实现等价效果
+        rows = q.order_by((JobRun.started_at.is_(None)).asc(), JobRun.started_at.desc()).limit(200).all()
         for r in rows:
             artifacts = []
             try:
