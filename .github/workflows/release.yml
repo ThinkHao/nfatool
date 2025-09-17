@@ -53,14 +53,32 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail;
-              yum -y install wget make gcc openssl-devel zlib-devel bzip2-devel libffi-devel xz-devel sqlite-devel readline-devel tk-devel;
+              yum -y install wget make gcc zlib-devel bzip2-devel libffi-devel xz-devel sqlite-devel readline-devel tk-devel perl;
+              # Build OpenSSL and ensure system can locate libs
+              OPENSSL_VER=1.1.1w;
+              cd /tmp && curl -fsSLO https://www.openssl.org/source/openssl-${OPENSSL_VER}.tar.gz && tar xf openssl-${OPENSSL_VER}.tar.gz;
+              cd openssl-${OPENSSL_VER};
+              ./config --prefix=/opt/openssl --openssldir=/opt/openssl -fPIC;
+              make -j2 && make install_sw;
+              echo "/opt/openssl/lib" > /etc/ld.so.conf.d/openssl.conf && ldconfig;
+              export OPENSSL_DIR=/opt/openssl;
+              export CPPFLAGS="-I${OPENSSL_DIR}/include";
+              export LDFLAGS="-Wl,-rpath,${OPENSSL_DIR}/lib -L${OPENSSL_DIR}/lib";
+              export PKG_CONFIG_PATH="${OPENSSL_DIR}/lib/pkgconfig";
+              # Build shared CPython
               PY_VER=3.11.9;
               cd /tmp && curl -fsSLO https://www.python.org/ftp/python/${PY_VER}/Python-${PY_VER}.tgz && tar xf Python-${PY_VER}.tgz;
               cd Python-${PY_VER};
-              ./configure --enable-optimizations --enable-shared --prefix=/opt/python/cp311-shared;
+              ./configure --enable-optimizations --enable-shared --with-openssl=${OPENSSL_DIR} --prefix=/opt/python/cp311-shared;
               make -j2 && make install;
+              echo "/opt/python/cp311-shared/lib" > /etc/ld.so.conf.d/python.conf && ldconfig;
               export PATH="/opt/python/cp311-shared/bin:$PATH";
-              export LD_LIBRARY_PATH="/opt/python/cp311-shared/lib:$LD_LIBRARY_PATH";
+              export LD_LIBRARY_PATH="/opt/python/cp311-shared/lib:${OPENSSL_DIR}/lib:$LD_LIBRARY_PATH";
+              # Verify SSL
+              python3 - <<'PY'
+import ssl; import sys; print('Python:', sys.version); print('OpenSSL:', ssl.OPENSSL_VERSION)
+PY
+              cd /src;
               python3 -m pip install --upgrade pip;
               python3 -m pip install -r server/requirements.txt pyinstaller;
               chmod +x server/build.sh;
