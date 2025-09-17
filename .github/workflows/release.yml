@@ -47,22 +47,25 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r server/requirements.txt
-          pip install pyinstaller
-
-      - name: Build Linux binary
+      - name: Build Linux binary in manylinux2014 (glibc 2.17)
         shell: bash
         run: |
-          chmod +x server/build.sh
-          ./server/build.sh nfa95
+          docker run --rm -v "$GITHUB_WORKSPACE":/src -w /src quay.io/pypa/manylinux2014_x86_64 \
+            /bin/bash -lc '
+              set -euo pipefail;
+              yum -y install wget make gcc openssl-devel zlib-devel bzip2-devel libffi-devel xz-devel sqlite-devel readline-devel tk-devel;
+              PY_VER=3.11.9;
+              cd /tmp && curl -fsSLO https://www.python.org/ftp/python/${PY_VER}/Python-${PY_VER}.tgz && tar xf Python-${PY_VER}.tgz;
+              cd Python-${PY_VER};
+              ./configure --enable-optimizations --enable-shared --prefix=/opt/python/cp311-shared;
+              make -j2 && make install;
+              export PATH="/opt/python/cp311-shared/bin:$PATH";
+              export LD_LIBRARY_PATH="/opt/python/cp311-shared/lib:$LD_LIBRARY_PATH";
+              python3 -m pip install --upgrade pip;
+              python3 -m pip install -r server/requirements.txt pyinstaller;
+              chmod +x server/build.sh;
+              ./server/build.sh nfa95;
+            '
 
       - name: Upload Artifact (Linux)
         uses: actions/upload-artifact@v4
