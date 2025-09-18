@@ -1,0 +1,34 @@
+[Unit]
+Description=NFA 95th Web Service
+After=network.target
+
+[Service]
+Type=simple
+# 建议以普通用户运行，见下文创建用户与权限
+User=nfa95
+Group=nfa95
+
+# 工作目录设为可执行文件所在目录
+WorkingDirectory=/home/nfa95
+
+# 载入环境变量（与 .env 同目录），可选。我们的程序也会自行读取 .env，二者不冲突。
+EnvironmentFile=-/home/nfa95/.env
+
+# 启动命令
+ExecStart=/home/nfa95/nfa95
+
+# 优雅停止（给 uvicorn 发 SIGINT）
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# 自动重启策略
+Restart=on-failure
+RestartSec=5s
+
+# 资源与安全（可按需调整）
+NoNewPrivileges=true
+LimitNOFILE=65536
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
