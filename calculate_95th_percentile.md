@@ -2,7 +2,9 @@
 
 ## 功能简介
 
-本工具用于计算指定省份、指定CP类型、指定时间范围内所有院校的95值。95值的计算方式为：将一段时间内的流速，按照从大到小排序，舍弃前5%的点，取剩下的最大的点。
+本工具用于计算指定省份、指定CP类型、指定时间范围内所有院校的95值。默认对每所院校分别计算；也可选择把“所有院校汇总后再计算”（见 `--aggregate-all`）。
+
+95值的计算方式（与行业常用定义等价）：取“底部95%样本中的最大值”。实现上采用 `np.partition`，复杂度约为 O(n)。
 
 流量单位换算方式：send 和 recv 的单位是 bytes，转换为 Mbps 的公式为：Mbps = (bytes * 8 / 60 / 1024 / 1024)
 
@@ -23,6 +25,9 @@
 7. 支持导出每日95值数据
 8. 支持按院校名单进行“排除院校单独计算 + 剩余院校单独计算/汇总”
 9. 默认仅统计 `type = 'yuanxiao'` 的院校，自动排除 `type = 'dianbo'`（点播）与 `type = 'zhibo'`（直播）
+10. 新增高性能路径：
+    - `--aggregate-all` 将所有院校在相同时间点上先汇总（recv/send 求和）再计算95值；配合 `--export-daily` 可得到“全市汇总的日95”。
+    - 批量拉取原始日志并在内存中分组计算，显著减少逐院校的数据库往返（默认启用）。
 
 ## 安装依赖
 
@@ -71,6 +76,8 @@ python calculate_95th_percentile.py --province 省份 --cp CP类型 --start-time
 | `--exclude-school` | `-esc` | 排除的院校名称，多个院校用逗号分隔。将对“排除名单院校”（逐校）与“剩余院校”（整体汇总）分别计算并分别输出。剩余院校会先在每个时间点上把 recv/send 求和后再计算95值。 | 否 | - |
 | `--sortby` |  | 按该字段排序输出，例如：95th_percentile_mbps、daily_95th_percentile_mbps、ipgroup_name 等 | 否 | - |
 | `--sort-order` |  | 排序顺序：asc（升序）或 desc（降序） | 否 | desc |
+| `--aggregate-all` |  | 将所有符合条件的院校在相同时间点上汇总（recv/send 求和）后再计算95值；配合 `--export-daily` 则输出“全市汇总”的日95。 | 否 | False |
+| `--batch-size` |  | 批量拉取日志时每批包含的 `(ipgroup_id, nfa_uuid)` 数量，过大可能导致 SQL 过长，过小会增加往返次数。 | 否 | 200 |
 
 ### 示例
 
@@ -94,7 +101,7 @@ python calculate_95th_percentile.py --province 北京市 --cp 电信 --start-tim
 python calculate_95th_percentile.py --province 四川省 --cp 教育网 --start-time "2025-03-01 00:00:00" --end-time "2025-03-26 00:00:00" --school "电子科技大学,四川大学"
 ```
 
-5. 导出指定省份和CP在某时间范围内的每日95值：
+5. 导出指定省份和CP在某时间范围内的每日95值（逐校）：
 ```bash
 python calculate_95th_percentile.py --province 湖北省 --cp 腾讯云 --start-time "2025-04-01 00:00:00" --end-time "2025-04-07 23:59:59" --export-daily --output 湖北省-腾讯云-每日95.csv
 ```
@@ -125,6 +132,19 @@ python calculate_95th_percentile.py --province 山东省 --cp bilibili \
 python calculate_95th_percentile.py --province 湖北省 --cp 腾讯云 \
   --start-time "2025-04-01 00:00:00" --end-time "2025-04-07 23:59:59" \
   --export-daily --sortby daily_95th_percentile_mbps --sort-order asc
+```
+
+9. 全部院校汇总后再计算（周期或每日）：
+```bash
+# 周期（整段时间）单行汇总
+python calculate_95th_percentile.py --province 天津市 --cp bilibili \
+  --start-time "2025-08-01 00:00:00" --end-time "2025-08-31 23:59:59" \
+  --aggregate-all --output 天津市-bilibili-8月-汇总95.csv
+
+# 每日（按天）汇总，得到“全市汇总”的日95
+python calculate_95th_percentile.py --province 天津市 --cp bilibili \
+  --start-time "2025-08-01 00:00:00" --end-time "2025-08-31 23:59:59" \
+  --aggregate-all --export-daily --output 天津市-bilibili-8月-全市日95.csv
 ```
 
 ## 输出结果
@@ -165,6 +185,8 @@ CSV文件包含以下字段：
 
 在此模式下，控制台不会输出汇总统计信息。
 
+补充：开启 `--aggregate-all` 时，输出对象为“全部院校汇总”，字段含义与上面一致，但 `ipgroup_name` 会为“全部院校汇总”，周期模式通常仅 1 行；每日模式为按天多行。
+
 **当使用排除名单 (`--exclude-school`) 时：**
 
 - 程序会将查询出来的院校分成两组：
@@ -187,3 +209,14 @@ CSV文件包含以下字段：
 5. 当某院校在所选时间范围内没有任何流量数据点：
    - 周期汇总模式（默认）：该院校将被跳过，不会写入一条 95 值为 0 的记录。
    - 每日导出模式：对没有数据的日期或院校也会跳过写入，对有数据的日期正常计算与输出。
+
+## 性能优化说明
+
+- 默认已启用批量拉取 + 内存分组计算，避免逐院校逐天/整段重复访问数据库。
+- 95 值计算采用 `numpy.partition`，比全量排序更快。
+- 数据库层面建议：
+  - 表 `nfa_ipgroup` 增加（或确认存在）索引：`(region, cp, type, school_name)`。
+  - 表 `nfa_ip_group_speed_logs_5m` 增加复合索引（择一或都建视场景定）：
+    - `(ipgroup_id, nfa_uuid, create_time)` 用于按院校/设备对齐时间点的查询。
+    - `(create_time, ipgroup_id, nfa_uuid)` 用于时间范围主导的聚合。
+  - 若支持覆盖索引，可将 `recv, send` 纳入索引以减少回表（视 MySQL 版本与存储引擎）。

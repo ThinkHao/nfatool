@@ -71,6 +71,8 @@
           <option value="send">send</option>
         </select>
         <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
+        <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
+        <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="newTask.params.school" placeholder="指定院校(逗号分隔)" />
         <input v-model="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
         <input v-model="newTask.params.sortby" placeholder="排序字段" />
@@ -168,6 +170,8 @@
           <option value="send">send</option>
         </select>
         <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
+        <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
+        <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="editTask.params.school" placeholder="指定院校(逗号分隔)" />
         <input v-model="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
         <input v-model="editTask.params.sortby" placeholder="排序字段" />
@@ -218,6 +222,6 @@
       </table>
     </section>
   </div>
-  <script src="/static/app.js?v=20250915-01"></script>
+  <script src="/static/app.js?v=20250919-01"></script>
 </body>
 </html>

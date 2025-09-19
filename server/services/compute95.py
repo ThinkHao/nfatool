@@ -95,6 +95,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     exclude_school = params.get("exclude_school")
     sortby = params.get("sortby")
     sort_order = params.get("sort_order", "desc")
+    aggregate_all = bool(params.get("aggregate_all", False))
+    batch_size = int(params.get("batch_size", 200))
 
     # Prefer env MySQL settings; fallback to db_config.ini if provided in params
     db_cfg = None
@@ -136,6 +138,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
 
             # 1) 排除组（逐校）
             if excluded_schools:
+                # 保持原有逐校行为（也可切换为 batched 版本以提升性能）
                 results_excluded = c95.process_schools(conn, excluded_schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
                 df_excluded = _to_dataframe(results_excluded)
                 # 排序
@@ -195,14 +198,26 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     artifacts += _export_df(df_remaining, job_id, f"{base_name}_remaining", export_formats)
             return artifacts
         else:
-            # 单组逐校
-            results = c95.process_schools(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
-            df = _to_dataframe(results)
-            if sortby and sortby in df.columns:
-                df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
             base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
-            artifacts += _export_df(df, job_id, base_name, export_formats)
-            return artifacts
+            if aggregate_all:
+                # 全部院校在时间点上汇总后再计算
+                rows = c95.aggregate_all_and_compute(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
+                df = _to_dataframe(rows)
+                if sortby and sortby in df.columns:
+                    df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                artifacts += _export_df(df, job_id, base_name, export_formats)
+                return artifacts
+            else:
+                # 逐校（或逐校按天）- 批量拉取 + 内存分组
+                rows = c95.process_schools_batched(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily, batch_size=batch_size)
+                if not rows:
+                    # 回退到原方法
+                    rows = c95.process_schools(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
+                df = _to_dataframe(rows)
+                if sortby and sortby in df.columns:
+                    df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                artifacts += _export_df(df, job_id, base_name, export_formats)
+                return artifacts
     finally:
         try:
             conn.close()

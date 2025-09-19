@@ -40,6 +40,10 @@ def parse_args():
     parser.add_argument('--exclude-school', '-esc', help='排除的院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学')
     parser.add_argument('--sortby', help='按该字段排序输出，例如：95th_percentile_mbps、daily_95th_percentile_mbps、ipgroup_name 等')
     parser.add_argument('--sort-order', choices=['asc', 'desc'], default='desc', help='排序顺序：asc（升序）或 desc（降序），默认 desc')
+    parser.add_argument('--aggregate-all', action='store_true',
+                        help='将所有符合条件的院校在相同时间点上汇总（recv/send 求和）后再计算95值；配合 --export-daily 则输出“全市汇总”的日95。')
+    parser.add_argument('--batch-size', type=int, default=200,
+                        help='批量拉取日志时每批包含的 (ipgroup_id, nfa_uuid) 数量，默认 200')
     return parser.parse_args()
 
 def load_db_config(config_file):
@@ -172,20 +176,128 @@ def calculate_95th_percentile(data, direction='both'):
     else:  # both - 取每个时间点的收发和
         values = (df['recv_mbps'] + df['send_mbps']).values
     
-    # 排序并计算95值
-    sorted_values = np.sort(values)[::-1]  # 从大到小排序
-    
-    # 计算95百分位的索引
-    n = len(sorted_values)
+    # 使用 np.partition 在 O(n) 时间内得到等价结果：
+    # 取“底部95%中的最大值”，即升序第 k 个元素（k = ceil(0.95*n) - 1）
+    n = len(values)
     if n == 0:
         return 0
-    
-    # 舍弃前5%的点，取剩下的最大的点
-    index_95th = int(n * 0.05)
-    if index_95th >= n:
-        index_95th = n - 1
-    
-    return sorted_values[index_95th]
+    k = int(np.ceil(n * 0.95)) - 1
+    if k < 0:
+        k = 0
+    if k >= n:
+        k = n - 1
+    part = np.partition(values, k)
+    return float(part[k])
+
+def calculate_95th_from_series(series: pd.Series) -> float:
+    """对已是 Mbps 的一维 Series 计算 95 值。"""
+    values = series.dropna().to_numpy()
+    n = len(values)
+    if n == 0:
+        return 0.0
+    k = int(np.ceil(n * 0.95)) - 1
+    if k < 0:
+        k = 0
+    if k >= n:
+        k = n - 1
+    part = np.partition(values, k)
+    return float(part[k])
+
+def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batch_size=200):
+    """
+    批量拉取多所院校在时间范围内的原始 5 分钟数据，返回 DataFrame：
+    列 [ipgroup_id, nfa_uuid, create_time, recv, send]
+    为避免单次 SQL 过长，按 batch_size 分批查询后合并。
+    """
+    if not pairs:
+        return pd.DataFrame()
+    frames = []
+    total = len(pairs)
+    for i in range(0, total, batch_size):
+        chunk = pairs[i:i + batch_size]
+        placeholders = ", ".join(["(%s, %s)"] * len(chunk))
+        sql = f"""
+            SELECT ipgroup_id, nfa_uuid, create_time, recv, send
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND (ipgroup_id, nfa_uuid) IN ({placeholders})
+            ORDER BY ipgroup_id, nfa_uuid, create_time
+        """
+        params = [start_time, end_time]
+        for ipg, uuid in chunk:
+            params.extend([ipg, uuid])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+                if rows:
+                    df = pd.DataFrame(rows)
+                    frames.append(df)
+        except Exception as e:
+            logger.error(f"批量拉取速度数据失败: {e}")
+            continue
+    if not frames:
+        return pd.DataFrame()
+    df_all = pd.concat(frames, ignore_index=True)
+    df_all['create_time'] = pd.to_datetime(df_all['create_time'])
+    return df_all
+
+def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200):
+    """
+    批量方式计算逐校（或逐校按天）95 值，显著减少数据库往返。
+    返回与 process_schools 相同结构的结果列表。
+    """
+    results = []
+    if not schools:
+        return results
+    pairs = [(s['ipgroup_id'], s['nfa_uuid']) for s in schools]
+    info_map = {(s['ipgroup_id'], s['nfa_uuid']): s for s in schools}
+    df = fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batch_size=batch_size)
+    if df.empty:
+        return results
+    df['recv_mbps'] = df['recv'] * 8 / 60 / 1024 / 1024
+    df['send_mbps'] = df['send'] * 8 / 60 / 1024 / 1024
+    if export_daily:
+        df['date'] = df['create_time'].dt.date
+        for (ipg, uuid, date_obj), g in df.groupby(['ipgroup_id', 'nfa_uuid', 'date'], sort=False):
+            s = info_map.get((ipg, uuid), {})
+            if direction == 'recv':
+                series = g['recv_mbps']
+            elif direction == 'send':
+                series = g['send_mbps']
+            else:
+                series = g['recv_mbps'] + g['send_mbps']
+            val = calculate_95th_from_series(series)
+            results.append({
+                'school_id': s.get('school_id', ''),
+                'ipgroup_name': s.get('ipgroup_name', ''),
+                'ipgroup_id': ipg,
+                'nfa_uuid': uuid,
+                'date': f"{date_obj:%Y-%m-%d}",
+                'daily_95th_percentile_mbps': val,
+                'direction': direction,
+                'data_points_daily': int(series.shape[0])
+            })
+    else:
+        for (ipg, uuid), g in df.groupby(['ipgroup_id', 'nfa_uuid'], sort=False):
+            s = info_map.get((ipg, uuid), {})
+            if direction == 'recv':
+                series = g['recv_mbps']
+            elif direction == 'send':
+                series = g['send_mbps']
+            else:
+                series = g['recv_mbps'] + g['send_mbps']
+            val = calculate_95th_from_series(series)
+            results.append({
+                'school_id': s.get('school_id', ''),
+                'ipgroup_name': s.get('ipgroup_name', ''),
+                'ipgroup_id': ipg,
+                'nfa_uuid': uuid,
+                '95th_percentile_mbps': val,
+                'data_points': int(series.shape[0]),
+                'direction': direction
+            })
+    return results
 
 # 新增：通用处理与保存函数，避免重复代码
 def _split_names_to_set(names_str):
@@ -309,6 +421,64 @@ def aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time):
     except Exception as e:
         logger.error(f"数据库端聚合剩余院校失败: {e}")
         return pd.DataFrame()
+
+def aggregate_all_and_compute(connection, schools, start_time, end_time, direction, export_daily):
+    """
+    对所有学校在相同时间点上进行汇总（recv/send 求和）后计算：
+    - 周期模式：输出 1 行“全部院校汇总”
+    - 每日模式：按天输出“全部院校汇总”
+    优先在数据库端按时间聚合以减少数据量。
+    """
+    if not schools:
+        return []
+    pairs = [(s['ipgroup_id'], s['nfa_uuid']) for s in schools]
+    df_agg = aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time)
+    if df_agg.empty:
+        df_raw = fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time)
+        if df_raw.empty:
+            return []
+        df_agg = df_raw.groupby('create_time', as_index=False)[['recv', 'send']].sum().sort_values('create_time')
+    df_agg['recv_mbps'] = df_agg['recv'] * 8 / 60 / 1024 / 1024
+    df_agg['send_mbps'] = df_agg['send'] * 8 / 60 / 1024 / 1024
+    if export_daily:
+        df_agg['date'] = df_agg['create_time'].dt.date
+        results = []
+        for date_obj, g in df_agg.groupby('date', sort=False):
+            if direction == 'recv':
+                series = g['recv_mbps']
+            elif direction == 'send':
+                series = g['send_mbps']
+            else:
+                series = g['recv_mbps'] + g['send_mbps']
+            val = calculate_95th_from_series(series)
+            results.append({
+                'school_id': '',
+                'ipgroup_name': '全部院校汇总',
+                'ipgroup_id': '',
+                'nfa_uuid': '',
+                'date': f"{date_obj:%Y-%m-%d}",
+                'daily_95th_percentile_mbps': val,
+                'direction': direction,
+                'data_points_daily': int(series.shape[0])
+            })
+        return results
+    else:
+        if direction == 'recv':
+            series = df_agg['recv_mbps']
+        elif direction == 'send':
+            series = df_agg['send_mbps']
+        else:
+            series = df_agg['recv_mbps'] + df_agg['send_mbps']
+        val = calculate_95th_from_series(series)
+        return [{
+            'school_id': '',
+            'ipgroup_name': '全部院校汇总',
+            'ipgroup_id': '',
+            'nfa_uuid': '',
+            '95th_percentile_mbps': val,
+            'data_points': int(series.shape[0]),
+            'direction': direction
+        }]
 
 def save_results(results, output_path, is_daily, direction, start_time, end_time, extra_log_prefix="", sort_by=None, sort_order='desc'):
     if not results:
@@ -468,8 +638,14 @@ def main():
             else:
                 logger.warning("排除后无剩余院校可计算，跳过剩余组计算。")
         else:
-            # 保持原有单组处理逻辑（逐校）
-            results = process_schools(connection, schools, start_time, end_time, args.direction, args.export_daily)
+            # 新增：支持整体汇总与批量逐校两种快速路径
+            if args.aggregate_all:
+                logger.info("启用 --aggregate-all：将所有符合条件的院校在相同时间点上汇总后计算95值")
+                results = aggregate_all_and_compute(connection, schools, start_time, end_time, args.direction, args.export_daily)
+            else:
+                logger.info("启用批量拉取快速模式：逐校（或逐校按天）在内存中计算95值，减少数据库往返")
+                results = process_schools_batched(connection, schools, start_time, end_time, args.direction, args.export_daily, batch_size=args.batch_size)
+
             if args.export_daily:
                 save_results(results, args.output, True, args.direction, start_time, end_time, sort_by=args.sortby, sort_order=args.sort_order)
             else:
