@@ -15,3 +15,7 @@ storage/
 
 # Allow requirements.txt under server
 !server/requirements.txt
+
+# Shell Script
+day-95.sh
+day-max.sh

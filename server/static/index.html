@@ -70,6 +70,14 @@
           <option value="recv">recv</option>
           <option value="send">send</option>
         </select>
+        <select v-model.number="newTask.params.unit_base">
+          <option :value="1024">单位换算 1024</option>
+          <option :value="1000">单位换算 1000</option>
+        </select>
+        <select v-model="newTask.params.settlement_mode">
+          <option value="range_95">结算方式：月95</option>
+          <option value="daily_95_avg">结算方式：日95平均</option>
+        </select>
         <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
         <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
@@ -168,6 +176,14 @@
           <option value="both">both</option>
           <option value="recv">recv</option>
           <option value="send">send</option>
+        </select>
+        <select v-model.number="editTask.params.unit_base">
+          <option :value="1024">单位换算 1024</option>
+          <option :value="1000">单位换算 1000</option>
+        </select>
+        <select v-model="editTask.params.settlement_mode">
+          <option value="range_95">结算方式：月95</option>
+          <option value="daily_95_avg">结算方式：日95平均</option>
         </select>
         <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
         <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>

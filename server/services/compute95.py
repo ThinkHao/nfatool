@@ -98,6 +98,15 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     aggregate_all = bool(params.get("aggregate_all", False))
     batch_size = int(params.get("batch_size", 200))
 
+    # New params
+    try:
+        unit_base = int(params.get("unit_base", 1024))
+    except Exception:
+        unit_base = 1024
+    if unit_base not in (1000, 1024):
+        unit_base = 1024
+    settlement_mode = params.get("settlement_mode")  # None -> preserve prior behavior
+
     # Prefer env MySQL settings; fallback to db_config.ini if provided in params
     db_cfg = None
     if settings.MYSQL_HOST and settings.MYSQL_USER and settings.MYSQL_PASSWORD and settings.MYSQL_DB:
@@ -138,9 +147,35 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
 
             # 1) 排除组（逐校）
             if excluded_schools:
-                # 保持原有逐校行为（也可切换为 batched 版本以提升性能）
-                results_excluded = c95.process_schools(conn, excluded_schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
-                df_excluded = _to_dataframe(results_excluded)
+                # 根据 settlement_mode 决定输出
+                if settlement_mode == 'daily_95_avg':
+                    # 计算每日95，再按学校平均
+                    rows_daily = c95.process_schools(
+                        conn, excluded_schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, True, unit_base=unit_base
+                    )
+                    df_daily = _to_dataframe(rows_daily)
+                    if export_daily:
+                        df_excluded = df_daily
+                    else:
+                        if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
+                            group_cols = ['school_id','ipgroup_name','ipgroup_id','nfa_uuid']
+                            df_excluded = (
+                                df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
+                                        .mean()
+                                        .rename(columns={'daily_95th_percentile_mbps': '95th_percentile_mbps'})
+                            )
+                        else:
+                            df_excluded = pd.DataFrame()
+                else:
+                    # 保持原有逐校行为（也可切换为 batched 版本以提升性能）
+                    results_excluded = c95.process_schools(
+                        conn, excluded_schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, export_daily, unit_base=unit_base
+                    )
+                    df_excluded = _to_dataframe(results_excluded)
                 # 排序
                 if sortby and sortby in df_excluded.columns:
                     df_excluded = df_excluded.sort_values(by=sortby, ascending=(sort_order == 'asc'))
@@ -165,11 +200,56 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                 if df_agg.empty:
                     df_agg = c95.aggregate_speed_data_for_schools(conn, remaining_schools, pd.to_datetime(start_time), pd.to_datetime(end_time))
                 if not df_agg.empty:
-                    if export_daily:
+                    if settlement_mode == 'daily_95_avg':
+                        # 先按天计算95；导出每日则逐天输出；否则对日95取平均
+                        df_agg['recv_mbps'] = df_agg['recv'] * 8 / 60 / float(unit_base) / float(unit_base)
+                        df_agg['send_mbps'] = df_agg['send'] * 8 / 60 / float(unit_base) / float(unit_base)
+                        df_agg['date'] = df_agg['create_time'].dt.date
+                        if export_daily:
+                            rows: List[Dict[str, Any]] = []
+                            for date_obj, g in df_agg.groupby('date'):
+                                if direction == 'recv':
+                                    series = g['recv_mbps']
+                                elif direction == 'send':
+                                    series = g['send_mbps']
+                                else:
+                                    series = g['recv_mbps'] + g['send_mbps']
+                                val = float(c95.calculate_95th_from_series(series))
+                                rows.append({
+                                    'school_id': '',
+                                    'ipgroup_name': '剩余院校汇总',
+                                    'ipgroup_id': '',
+                                    'nfa_uuid': '',
+                                    'date': f"{date_obj:%Y-%m-%d}",
+                                    'daily_95th_percentile_mbps': val,
+                                    'direction': direction,
+                                    'data_points_daily': int(series.shape[0])
+                                })
+                            df_remaining = pd.DataFrame(rows)
+                        else:
+                            vals = []
+                            for date_obj, g in df_agg.groupby('date'):
+                                if direction == 'recv':
+                                    series = g['recv_mbps']
+                                elif direction == 'send':
+                                    series = g['send_mbps']
+                                else:
+                                    series = g['recv_mbps'] + g['send_mbps']
+                                vals.append(float(c95.calculate_95th_from_series(series)))
+                            avg_val = float(pd.Series(vals).mean()) if vals else 0.0
+                            df_remaining = pd.DataFrame([{
+                                'school_id': '',
+                                'ipgroup_name': '剩余院校汇总',
+                                'ipgroup_id': '',
+                                'nfa_uuid': '',
+                                '95th_percentile_mbps': avg_val,
+                                'direction': direction
+                            }])
+                    elif export_daily:
                         df_agg['date'] = df_agg['create_time'].dt.date
                         rows: List[Dict[str, Any]] = []
                         for date_obj, group in df_agg.groupby('date'):
-                            val = c95.calculate_95th_percentile(group.to_dict('records'), direction)
+                            val = c95.calculate_95th_percentile(group.to_dict('records'), direction, unit_base=unit_base)
                             rows.append({
                                 'school_id': '',
                                 'ipgroup_name': '剩余院校汇总',
@@ -182,7 +262,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                             })
                         df_remaining = pd.DataFrame(rows)
                     else:
-                        val = c95.calculate_95th_percentile(df_agg.to_dict('records'), direction)
+                        val = c95.calculate_95th_percentile(df_agg.to_dict('records'), direction, unit_base=unit_base)
                         df_remaining = pd.DataFrame([{
                             'school_id': '',
                             'ipgroup_name': '剩余院校汇总',
@@ -201,19 +281,82 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
             base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
             if aggregate_all:
                 # 全部院校在时间点上汇总后再计算
-                rows = c95.aggregate_all_and_compute(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
-                df = _to_dataframe(rows)
+                if settlement_mode == 'daily_95_avg':
+                    # 先拿到每日95列表
+                    rows_daily = c95.aggregate_all_and_compute(
+                        conn, schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, True, unit_base=unit_base
+                    )
+                    df_daily = _to_dataframe(rows_daily)
+                    if export_daily:
+                        df = df_daily
+                    else:
+                        if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
+                            avg_val = float(df_daily['daily_95th_percentile_mbps'].mean())
+                        else:
+                            avg_val = 0.0
+                        df = pd.DataFrame([{
+                            'school_id': '',
+                            'ipgroup_name': '全部院校汇总',
+                            'ipgroup_id': '',
+                            'nfa_uuid': '',
+                            '95th_percentile_mbps': avg_val,
+                            'direction': direction
+                        }])
+                else:
+                    rows = c95.aggregate_all_and_compute(
+                        conn, schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, export_daily, unit_base=unit_base
+                    )
+                    df = _to_dataframe(rows)
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 artifacts += _export_df(df, job_id, base_name, export_formats)
                 return artifacts
             else:
                 # 逐校（或逐校按天）- 批量拉取 + 内存分组
-                rows = c95.process_schools_batched(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily, batch_size=batch_size)
-                if not rows:
-                    # 回退到原方法
-                    rows = c95.process_schools(conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), direction, export_daily)
-                df = _to_dataframe(rows)
+                if settlement_mode == 'daily_95_avg':
+                    # 先每日95，再根据 export_daily 决定是否求平均
+                    rows_daily = c95.process_schools_batched(
+                        conn, schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, True, batch_size=batch_size, unit_base=unit_base
+                    )
+                    if not rows_daily:
+                        rows_daily = c95.process_schools(
+                            conn, schools,
+                            pd.to_datetime(start_time), pd.to_datetime(end_time),
+                            direction, True, unit_base=unit_base
+                        )
+                    df_daily = _to_dataframe(rows_daily)
+                    if export_daily:
+                        df = df_daily
+                    else:
+                        if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
+                            group_cols = ['school_id','ipgroup_name','ipgroup_id','nfa_uuid']
+                            df = (
+                                df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
+                                       .mean()
+                                       .rename(columns={'daily_95th_percentile_mbps': '95th_percentile_mbps'})
+                            )
+                        else:
+                            df = pd.DataFrame()
+                else:
+                    rows = c95.process_schools_batched(
+                        conn, schools,
+                        pd.to_datetime(start_time), pd.to_datetime(end_time),
+                        direction, export_daily, batch_size=batch_size, unit_base=unit_base
+                    )
+                    if not rows:
+                        # 回退到原方法
+                        rows = c95.process_schools(
+                            conn, schools,
+                            pd.to_datetime(start_time), pd.to_datetime(end_time),
+                            direction, export_daily, unit_base=unit_base
+                        )
+                    df = _to_dataframe(rows)
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 artifacts += _export_df(df, job_id, base_name, export_formats)

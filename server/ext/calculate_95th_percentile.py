@@ -148,7 +148,7 @@ def get_speed_data(connection, ipgroup_id, nfa_uuid, start_time, end_time):
         logger.error(f"查询流速数据失败 (ipgroup_id={ipgroup_id}, nfa_uuid={nfa_uuid}): {e}")
         return []
 
-def calculate_95th_percentile(data, direction='both'):
+def calculate_95th_percentile(data, direction='both', unit_base: int = 1024):
     """计算95值
     
     Args:
@@ -163,10 +163,15 @@ def calculate_95th_percentile(data, direction='both'):
     
     # 转换为DataFrame
     df = pd.DataFrame(data)
+    # 确保数值列为 float，避免 Decimal 与 float 混算
+    for col in ('recv', 'send'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
     
-    # 将流量从字节转换为Mbps (Megabits per second)，按照单位换算方式.txt中的公式
-    df['recv_mbps'] = df['recv'] * 8 / 60 / 1024 / 1024  # bytes * 8 / 60 / 1024 / 1024
-    df['send_mbps'] = df['send'] * 8 / 60 / 1024 / 1024  # bytes * 8 / 60 / 1024 / 1024
+    # 将流量从字节转换为 Mbps (Megabits per second)
+    base = float(unit_base or 1024)
+    df['recv_mbps'] = df['recv'] * 8 / 60 / base / base
+    df['send_mbps'] = df['send'] * 8 / 60 / base / base
     
     # 根据方向计算95值
     if direction == 'recv':
@@ -242,7 +247,7 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
     df_all['create_time'] = pd.to_datetime(df_all['create_time'])
     return df_all
 
-def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200):
+def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200, unit_base: int = 1024):
     """
     批量方式计算逐校（或逐校按天）95 值，显著减少数据库往返。
     返回与 process_schools 相同结构的结果列表。
@@ -255,8 +260,13 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
     df = fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batch_size=batch_size)
     if df.empty:
         return results
-    df['recv_mbps'] = df['recv'] * 8 / 60 / 1024 / 1024
-    df['send_mbps'] = df['send'] * 8 / 60 / 1024 / 1024
+    # 确保数值列为 float
+    for col in ('recv', 'send'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    base = float(unit_base or 1024)
+    df['recv_mbps'] = df['recv'] * 8 / 60 / base / base
+    df['send_mbps'] = df['send'] * 8 / 60 / base / base
     if export_daily:
         df['date'] = df['create_time'].dt.date
         for (ipg, uuid, date_obj), g in df.groupby(['ipgroup_id', 'nfa_uuid', 'date'], sort=False):
@@ -305,7 +315,7 @@ def _split_names_to_set(names_str):
         return set()
     return {n.strip() for n in names_str.split(',') if n.strip()}
 
-def process_schools(connection, schools, start_time, end_time, direction, export_daily):
+def process_schools(connection, schools, start_time, end_time, direction, export_daily, unit_base: int = 1024):
     """按给定学校列表计算95值，返回结果列表"""
     results = []
     if not schools:
@@ -332,7 +342,7 @@ def process_schools(connection, schools, start_time, end_time, direction, export
 
             daily_groups = df_speed.groupby('date')
             for date_obj, group_data in daily_groups:
-                daily_95th_value = calculate_95th_percentile(group_data.to_dict('records'), direction)
+                daily_95th_value = calculate_95th_percentile(group_data.to_dict('records'), direction, unit_base=unit_base)
                 results.append({
                     'school_id': school['school_id'],
                     'ipgroup_name': school['ipgroup_name'],
@@ -358,7 +368,7 @@ def process_schools(connection, schools, start_time, end_time, direction, export
                 logger.warning(f"未找到院校 {school['ipgroup_name']} (ID: {school['school_id']}) 在指定时间范围内的流速数据，已跳过写入。")
                 continue
 
-            percentile_95 = calculate_95th_percentile(speed_data, direction)
+            percentile_95 = calculate_95th_percentile(speed_data, direction, unit_base=unit_base)
             results.append({
                 'school_id': school['school_id'],
                 'ipgroup_name': school['ipgroup_name'],
@@ -377,6 +387,10 @@ def aggregate_speed_data_for_schools(connection, schools, start_time, end_time):
         if not data:
             continue
         df = pd.DataFrame(data)
+        # 确保数值列为 float
+        for col in ('recv', 'send'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         if df.empty:
             continue
         frames.append(df[['create_time', 'recv', 'send']])
@@ -417,12 +431,16 @@ def aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time):
                 return pd.DataFrame()
             df = pd.DataFrame(rows)
             df['create_time'] = pd.to_datetime(df['create_time'])
+            # 确保数值列为 float
+            for col in ('recv', 'send'):
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
             return df
     except Exception as e:
         logger.error(f"数据库端聚合剩余院校失败: {e}")
         return pd.DataFrame()
 
-def aggregate_all_and_compute(connection, schools, start_time, end_time, direction, export_daily):
+def aggregate_all_and_compute(connection, schools, start_time, end_time, direction, export_daily, unit_base: int = 1024):
     """
     对所有学校在相同时间点上进行汇总（recv/send 求和）后计算：
     - 周期模式：输出 1 行“全部院校汇总”
@@ -438,8 +456,13 @@ def aggregate_all_and_compute(connection, schools, start_time, end_time, directi
         if df_raw.empty:
             return []
         df_agg = df_raw.groupby('create_time', as_index=False)[['recv', 'send']].sum().sort_values('create_time')
-    df_agg['recv_mbps'] = df_agg['recv'] * 8 / 60 / 1024 / 1024
-    df_agg['send_mbps'] = df_agg['send'] * 8 / 60 / 1024 / 1024
+    # 确保数值列为 float
+    for col in ('recv', 'send'):
+        if col in df_agg.columns:
+            df_agg[col] = pd.to_numeric(df_agg[col], errors='coerce')
+    base = float(unit_base or 1024)
+    df_agg['recv_mbps'] = df_agg['recv'] * 8 / 60 / base / base
+    df_agg['send_mbps'] = df_agg['send'] * 8 / 60 / base / base
     if export_daily:
         df_agg['date'] = df_agg['create_time'].dt.date
         results = []

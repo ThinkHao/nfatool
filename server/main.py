@@ -67,6 +67,15 @@ def on_startup():
     schedule_retention_cleanup()
 
 
+@app.on_event("shutdown")
+def on_shutdown():
+    try:
+        if scheduler:
+            scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+
+
 def _get_next_run_time(task_id: int):
     try:
         if scheduler:
