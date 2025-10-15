@@ -99,7 +99,7 @@ def connect_to_db(db_config):
 def get_schools_by_province_and_cp(connection, province, cp, school_names_str=None):
     """获取指定省份、CP类型以及可选的指定院校的所有院校（仅 type='yuanxiao'）"""
     base_query = """
-    SELECT DISTINCT school_id, school_name, ipgroup_name, ipgroup_id, nfa_uuid
+    SELECT DISTINCT school_id, school_name, ipgroup_name, ipgroup_id, nfa_uuid, cp
     FROM nfa_ipgroup
     WHERE region = %s AND cp = %s AND type = %s
     """
@@ -247,7 +247,7 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
     df_all['create_time'] = pd.to_datetime(df_all['create_time'])
     return df_all
 
-def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200, unit_base: int = 1024):
+def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200, unit_base: int = 1024, combine_v4_v6: bool = False, merge_key: str | None = None):
     """
     批量方式计算逐校（或逐校按天）95 值，显著减少数据库往返。
     返回与 process_schools 相同结构的结果列表。
@@ -267,46 +267,129 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
     base = float(unit_base or 1024)
     df['recv_mbps'] = df['recv'] * 8 / 60 / base / base
     df['send_mbps'] = df['send'] * 8 / 60 / base / base
-    if export_daily:
-        df['date'] = df['create_time'].dt.date
-        for (ipg, uuid, date_obj), g in df.groupby(['ipgroup_id', 'nfa_uuid', 'date'], sort=False):
-            s = info_map.get((ipg, uuid), {})
-            if direction == 'recv':
-                series = g['recv_mbps']
-            elif direction == 'send':
-                series = g['send_mbps']
-            else:
-                series = g['recv_mbps'] + g['send_mbps']
-            val = calculate_95th_from_series(series)
-            results.append({
-                'school_id': s.get('school_id', ''),
-                'ipgroup_name': s.get('ipgroup_name', ''),
-                'ipgroup_id': ipg,
-                'nfa_uuid': uuid,
-                'date': f"{date_obj:%Y-%m-%d}",
-                'daily_95th_percentile_mbps': val,
-                'direction': direction,
-                'data_points_daily': int(series.shape[0])
-            })
+
+    def _base_name(name: str) -> str:
+        if not isinstance(name, str):
+            return ''
+        n = name.strip()
+        if n.endswith('_V4') or n.endswith('_v4'):
+            return n[:-3]
+        if n.endswith('_V6') or n.endswith('_v6'):
+            return n[:-3]
+        return n
+
+    # 兼容：若 merge_key 未指定而 combine_v4_v6=True，则等价于 merge_key='ipgroup_name_base'
+    eff_merge_key = (merge_key or '').strip().lower()
+    if not eff_merge_key and combine_v4_v6:
+        eff_merge_key = 'ipgroup_name_base'
+
+    if eff_merge_key:
+        # 构建 (ipgroup_id, nfa_uuid) -> (merge_value, merge_label) 映射
+        def _pair_to_merge(s: dict):
+            if eff_merge_key == 'school_id':
+                val = s.get('school_id')
+                label = s.get('ipgroup_name') or s.get('school_name') or str(val)
+                return val, label
+            elif eff_merge_key == 'school_name_plus_cp':
+                name = (s.get('school_name') or '').strip()
+                cpv = (s.get('cp') or '').strip()
+                val = f"{name}_{cpv}".strip('_')
+                return val, val
+            elif eff_merge_key == 'school_name':
+                val = s.get('school_name') or ''
+                return val, val
+            elif eff_merge_key == 'ipgroup_name':
+                val = s.get('ipgroup_name') or ''
+                return val, val
+            else:  # ipgroup_name_base
+                val = _base_name(s.get('ipgroup_name', ''))
+                return val, val
+
+        merge_map = { (s['ipgroup_id'], s['nfa_uuid']): _pair_to_merge(s) for s in schools }
+        df[['merge_value','merge_label']] = df.apply(
+            lambda r: pd.Series(merge_map.get((r['ipgroup_id'], r['nfa_uuid']), ('', ''))), axis=1
+        )
+        # 先在相同时间点按 merge_value 聚合
+        df_sum = df.groupby(['merge_value', 'merge_label', 'create_time'], as_index=False)[['recv_mbps','send_mbps']].sum()
+        if export_daily:
+            df_sum['date'] = df_sum['create_time'].dt.date
+            for (mv, ml, date_obj), g in df_sum.groupby(['merge_value', 'merge_label', 'date'], sort=False):
+                if direction == 'recv':
+                    series = g['recv_mbps']
+                elif direction == 'send':
+                    series = g['send_mbps']
+                else:
+                    series = g['recv_mbps'] + g['send_mbps']
+                val = calculate_95th_from_series(series)
+                results.append({
+                    'school_id': mv if eff_merge_key == 'school_id' else '',
+                    'ipgroup_name': ml,
+                    'ipgroup_id': '',
+                    'nfa_uuid': '',
+                    'date': f"{date_obj:%Y-%m-%d}",
+                    'daily_95th_percentile_mbps': val,
+                    'direction': direction,
+                    'data_points_daily': int(series.shape[0])
+                })
+        else:
+            for (mv, ml), g in df_sum.groupby(['merge_value','merge_label'], sort=False):
+                if direction == 'recv':
+                    series = g['recv_mbps']
+                elif direction == 'send':
+                    series = g['send_mbps']
+                else:
+                    series = g['recv_mbps'] + g['send_mbps']
+                val = calculate_95th_from_series(series)
+                results.append({
+                    'school_id': mv if eff_merge_key == 'school_id' else '',
+                    'ipgroup_name': ml,
+                    'ipgroup_id': '',
+                    'nfa_uuid': '',
+                    '95th_percentile_mbps': val,
+                    'data_points': int(series.shape[0]),
+                    'direction': direction
+                })
     else:
-        for (ipg, uuid), g in df.groupby(['ipgroup_id', 'nfa_uuid'], sort=False):
-            s = info_map.get((ipg, uuid), {})
-            if direction == 'recv':
-                series = g['recv_mbps']
-            elif direction == 'send':
-                series = g['send_mbps']
-            else:
-                series = g['recv_mbps'] + g['send_mbps']
-            val = calculate_95th_from_series(series)
-            results.append({
-                'school_id': s.get('school_id', ''),
-                'ipgroup_name': s.get('ipgroup_name', ''),
-                'ipgroup_id': ipg,
-                'nfa_uuid': uuid,
-                '95th_percentile_mbps': val,
-                'data_points': int(series.shape[0]),
-                'direction': direction
-            })
+        if export_daily:
+            df['date'] = df['create_time'].dt.date
+            for (ipg, uuid, date_obj), g in df.groupby(['ipgroup_id', 'nfa_uuid', 'date'], sort=False):
+                s = info_map.get((ipg, uuid), {})
+                if direction == 'recv':
+                    series = g['recv_mbps']
+                elif direction == 'send':
+                    series = g['send_mbps']
+                else:
+                    series = g['recv_mbps'] + g['send_mbps']
+                val = calculate_95th_from_series(series)
+                results.append({
+                    'school_id': s.get('school_id', ''),
+                    'ipgroup_name': s.get('ipgroup_name', ''),
+                    'ipgroup_id': ipg,
+                    'nfa_uuid': uuid,
+                    'date': f"{date_obj:%Y-%m-%d}",
+                    'daily_95th_percentile_mbps': val,
+                    'direction': direction,
+                    'data_points_daily': int(series.shape[0])
+                })
+        else:
+            for (ipg, uuid), g in df.groupby(['ipgroup_id', 'nfa_uuid'], sort=False):
+                s = info_map.get((ipg, uuid), {})
+                if direction == 'recv':
+                    series = g['recv_mbps']
+                elif direction == 'send':
+                    series = g['send_mbps']
+                else:
+                    series = g['recv_mbps'] + g['send_mbps']
+                val = calculate_95th_from_series(series)
+                results.append({
+                    'school_id': s.get('school_id', ''),
+                    'ipgroup_name': s.get('ipgroup_name', ''),
+                    'ipgroup_id': ipg,
+                    'nfa_uuid': uuid,
+                    '95th_percentile_mbps': val,
+                    'data_points': int(series.shape[0]),
+                    'direction': direction
+                })
     return results
 
 # 新增：通用处理与保存函数，避免重复代码

@@ -79,6 +79,15 @@
           <option value="daily_95_avg">结算方式：日95平均</option>
         </select>
         <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
+        <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" /> V4/V6累加</label>
+        <select v-model="newTask.params.merge_key">
+          <option value="">合并键：不合并</option>
+          <option value="ipgroup_name_base">合并键：按名称去后缀(_V4/_V6)</option>
+          <option value="ipgroup_name">合并键：按IP组名称</option>
+          <option value="school_name_plus_cp">合并键：学校名称+CP</option>
+          <option value="school_id">合并键：按学校ID</option>
+          <option value="school_name">合并键：按学校名称</option>
+        </select>
         <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="newTask.params.school" placeholder="指定院校(逗号分隔)" />
@@ -186,6 +195,15 @@
           <option value="daily_95_avg">结算方式：日95平均</option>
         </select>
         <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
+        <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" /> V4/V6累加</label>
+        <select v-model="editTask.params.merge_key">
+          <option value="">合并键：不合并</option>
+          <option value="ipgroup_name_base">合并键：按名称去后缀(_V4/_V6)</option>
+          <option value="ipgroup_name">合并键：按IP组名称</option>
+          <option value="school_name_plus_cp">合并键：学校名称+CP</option>
+          <option value="school_id">合并键：按学校ID</option>
+          <option value="school_name">合并键：按学校名称</option>
+        </select>
         <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="editTask.params.school" placeholder="指定院校(逗号分隔)" />

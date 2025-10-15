@@ -106,6 +106,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     if unit_base not in (1000, 1024):
         unit_base = 1024
     settlement_mode = params.get("settlement_mode")  # None -> preserve prior behavior
+    combine_v4_v6 = bool(params.get("combine_v4_v6", False))
+    merge_key = params.get("merge_key")
 
     # Prefer env MySQL settings; fallback to db_config.ini if provided in params
     db_cfg = None
@@ -149,11 +151,11 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
             if excluded_schools:
                 # 根据 settlement_mode 决定输出
                 if settlement_mode == 'daily_95_avg':
-                    # 计算每日95，再按学校平均
-                    rows_daily = c95.process_schools(
+                    # 计算每日95，再按学校平均（使用 batched 以支持 V4/V6 合并）
+                    rows_daily = c95.process_schools_batched(
                         conn, excluded_schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, True, unit_base=unit_base
+                        direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
                     df_daily = _to_dataframe(rows_daily)
                     if export_daily:
@@ -169,11 +171,11 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                         else:
                             df_excluded = pd.DataFrame()
                 else:
-                    # 保持原有逐校行为（也可切换为 batched 版本以提升性能）
-                    results_excluded = c95.process_schools(
+                    # 逐校（或逐校按天）- 使用 batched 版本以支持 V4/V6 合并
+                    results_excluded = c95.process_schools_batched(
                         conn, excluded_schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, export_daily, unit_base=unit_base
+                        direction, export_daily, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
                     df_excluded = _to_dataframe(results_excluded)
                 # 排序
@@ -322,7 +324,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     rows_daily = c95.process_schools_batched(
                         conn, schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, True, batch_size=batch_size, unit_base=unit_base
+                        direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
                     if not rows_daily:
                         rows_daily = c95.process_schools(
@@ -347,7 +349,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     rows = c95.process_schools_batched(
                         conn, schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, export_daily, batch_size=batch_size, unit_base=unit_base
+                        direction, export_daily, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
                     if not rows:
                         # 回退到原方法

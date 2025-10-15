@@ -24,7 +24,7 @@ createApp({
         timezone: 'Asia/Shanghai',
         window_selector: 'custom',
         window_params: {},
-        params: { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95' },
+        params: { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95' },
         export_formats: ['csv'],
         output_filename_template: ''
       },
@@ -54,8 +54,9 @@ createApp({
       clone.kind = clone.kind || 'one_off'
       clone.window_selector = clone.window_selector || 'custom'
       clone.window_params = clone.window_params || {}
-      clone.params = clone.params || { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95' }
+      clone.params = clone.params || { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95' }
       if (typeof clone.params.aggregate_all !== 'boolean') clone.params.aggregate_all = false
+      if (typeof clone.params.combine_v4_v6 !== 'boolean') clone.params.combine_v4_v6 = false
       if (!clone.params.batch_size) clone.params.batch_size = 200
       if (clone.params.unit_base !== 1000 && clone.params.unit_base !== 1024) clone.params.unit_base = 1024
       if (!clone.params.settlement_mode) clone.params.settlement_mode = 'range_95'
