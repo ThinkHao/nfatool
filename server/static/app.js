@@ -32,6 +32,86 @@ createApp({
     }
   },
   methods: {
+    // 将 'YYYY-MM-DD HH:MM:SS' 转换为 <input type=datetime-local> 需要的 'YYYY-MM-DDTHH:MM:SS'
+    toLocalInputString(str) {
+      if (!str || typeof str !== 'string') return ''
+      return str.replace(' ', 'T')
+    },
+    // 将 datetime-local 值转换为后端需要的 'YYYY-MM-DD HH:MM:SS'
+    fromLocalInputString(str) {
+      if (!str || typeof str !== 'string') return ''
+      return str.replace('T', ' ')
+    },
+    // 规范化自定义时间窗口：把日期选择(start_date/end_date)同步到 start_time/end_time，
+    // 并在编辑时把已有值回填为日期（固定开始 00:00:00，结束 23:59:59）
+    normalizeCustomWindow(obj) {
+      if (!obj) return
+      const wp = obj.window_params = (obj.window_params || {})
+      if (obj.window_selector !== 'custom') return
+      // 若用户选择了日期，生成标准时间串
+      if (wp.start_date) {
+        wp.start_time = `${wp.start_date} 00:00:00`
+      }
+      if (wp.end_date) {
+        wp.end_time = `${wp.end_date} 23:59:59`
+      }
+      // 若处于编辑状态，只存在 start_time/end_time，则回填日期字段
+      if (!wp.start_date && wp.start_time) {
+        const s = String(wp.start_time)
+        wp.start_date = s.split(' ')[0]
+      }
+      if (!wp.end_date && wp.end_time) {
+        const e = String(wp.end_time)
+        wp.end_date = e.split(' ')[0]
+      }
+    },
+    fmtYMD(d) {
+      const p = (x) => String(x).padStart(2, '0')
+      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`
+    },
+    initRangePickerNew() {
+      const el = document.getElementById('range-new')
+      if (!el) return
+      if (this._fpNew) { try { this._fpNew.destroy() } catch {} this._fpNew = null }
+      const obj = this.newTask
+      this.normalizeCustomWindow(obj)
+      const def = []
+      if (obj.window_params.start_date) def.push(obj.window_params.start_date)
+      if (obj.window_params.end_date) def.push(obj.window_params.end_date)
+      this._fpNew = flatpickr(el, {
+        mode: 'range', locale: 'zh', dateFormat: 'Y-m-d', defaultDate: def,
+        onChange: (sel) => {
+          if (!sel || !sel.length) return
+          const s = this.fmtYMD(sel[0])
+          const e = this.fmtYMD(sel[sel.length > 1 ? 1 : 0])
+          this.newTask.window_params.start_date = s
+          this.newTask.window_params.end_date = e
+          this.normalizeCustomWindow(this.newTask)
+        }
+      })
+    },
+    initRangePickerEdit() {
+      const el = document.getElementById('range-edit')
+      if (!el) return
+      if (this._fpEdit) { try { this._fpEdit.destroy() } catch {} this._fpEdit = null }
+      if (!this.editTask) return
+      const obj = this.editTask
+      this.normalizeCustomWindow(obj)
+      const def = []
+      if (obj.window_params.start_date) def.push(obj.window_params.start_date)
+      if (obj.window_params.end_date) def.push(obj.window_params.end_date)
+      this._fpEdit = flatpickr(el, {
+        mode: 'range', locale: 'zh', dateFormat: 'Y-m-d', defaultDate: def,
+        onChange: (sel) => {
+          if (!sel || !sel.length) return
+          const s = this.fmtYMD(sel[0])
+          const e = this.fmtYMD(sel[sel.length > 1 ? 1 : 0])
+          this.editTask.window_params.start_date = s
+          this.editTask.window_params.end_date = e
+          this.normalizeCustomWindow(this.editTask)
+        }
+      })
+    },
     async checkHealth() {
       const res = await fetch('/api/health')
       const data = await res.json()
@@ -43,6 +123,8 @@ createApp({
       this.tasks = await res.json()
     },
     async createTask() {
+      // 先规范化自定义时间窗口
+      this.normalizeCustomWindow(this.newTask)
       if (!this.validateTask(this.newTask)) return
       const res = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(this.newTask) }, this.apiKey)
       if (!res.ok) { alert('创建失败'); return }
@@ -54,6 +136,8 @@ createApp({
       clone.kind = clone.kind || 'one_off'
       clone.window_selector = clone.window_selector || 'custom'
       clone.window_params = clone.window_params || {}
+      // 回填 datetime-local 显示值
+      this.normalizeCustomWindow(clone)
       clone.params = clone.params || { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95' }
       if (typeof clone.params.aggregate_all !== 'boolean') clone.params.aggregate_all = false
       if (typeof clone.params.combine_v4_v6 !== 'boolean') clone.params.combine_v4_v6 = false
@@ -63,12 +147,15 @@ createApp({
       clone.export_formats = clone.export_formats && clone.export_formats.length ? clone.export_formats : ['csv']
       clone.timezone = clone.timezone || 'Asia/Shanghai'
       this.editTask = clone
+      this.$nextTick(() => { if (this.editTask && this.editTask.window_selector === 'custom') this.initRangePickerEdit() })
     },
     cancelEdit() {
       this.editTask = null
     },
     async saveEdit() {
       if (!this.editTask || !this.editTask.id) return
+      // 先规范化自定义时间窗口
+      this.normalizeCustomWindow(this.editTask)
       if (!this.validateTask(this.editTask)) return
       const allowKeys = ['name','active','kind','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
       const body = {}
@@ -121,6 +208,8 @@ createApp({
       const fmtY_M_D = (d) => `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`
 
       if (sel === 'custom') {
+        // 同步一次，确保有标准字段
+        this.normalizeCustomWindow(obj)
         const s = (obj.window_params && obj.window_params.start_time) || ''
         const e = (obj.window_params && obj.window_params.end_time) || ''
         const sd = s ? (s.split(' ')[0]) : ''
@@ -188,6 +277,7 @@ createApp({
       }
       // 自定义时间范围时需要开始/结束
       if (obj.window_selector === 'custom') {
+        this.normalizeCustomWindow(obj)
         const wp = obj.window_params || {}
         if (!wp.start_time || !wp.end_time) { alert('自定义时间范围需要填写开始与结束时间'); return false }
       }
@@ -226,9 +316,21 @@ createApp({
       }
     }
   },
+  watch: {
+    'newTask.window_selector'(v) {
+      if (v === 'custom') this.$nextTick(() => this.initRangePickerNew())
+    },
+    editTask(v) {
+      if (v && v.window_selector === 'custom') this.$nextTick(() => this.initRangePickerEdit())
+    },
+    'editTask.window_selector'(v) {
+      if (v === 'custom') this.$nextTick(() => this.initRangePickerEdit())
+    }
+  },
   mounted() {
     this.checkHealth()
     this.loadTasks()
     this.loadRuns()
+    this.$nextTick(() => { if (this.newTask.window_selector === 'custom') this.initRangePickerNew() })
   }
 }).mount('#app')

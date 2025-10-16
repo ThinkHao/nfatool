@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>NFA 95th 服务</title>
   <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
 </head>
 <body>
   <div id="app">
@@ -58,8 +61,7 @@
           <option value="last_n_days">最后N天</option>
         </select>
         <input v-if="newTask.window_selector==='last_n_days'" v-model.number="newTask.window_params.n" type="number" min="1" placeholder="N(天)" />
-        <input v-if="newTask.window_selector==='custom'" v-model="newTask.window_params.start_time" placeholder="开始时间 YYYY-MM-DD HH:MM:SS" />
-        <input v-if="newTask.window_selector==='custom'" v-model="newTask.window_params.end_time" placeholder="结束时间 YYYY-MM-DD HH:MM:SS" />
+        <input v-if="newTask.window_selector==='custom'" id="range-new" placeholder="选择日期范围" />
       </div>
       <div class="row">
         <span style="margin-right:6px;">匹配条件：</span>
@@ -174,8 +176,7 @@
           <option value="last_n_days">最后N天</option>
         </select>
         <input v-if="editTask.window_selector==='last_n_days'" v-model.number="editTask.window_params.n" type="number" min="1" placeholder="N(天)" />
-        <input v-if="editTask.window_selector==='custom'" v-model="editTask.window_params.start_time" placeholder="开始时间 YYYY-MM-DD HH:MM:SS" />
-        <input v-if="editTask.window_selector==='custom'" v-model="editTask.window_params.end_time" placeholder="结束时间 YYYY-MM-DD HH:MM:SS" />
+        <input v-if="editTask.window_selector==='custom'" id="range-edit" placeholder="选择日期范围" />
       </div>
       <div class="row">
         <span style="margin-right:6px;">匹配条件：</span>
