@@ -98,8 +98,31 @@ def connect_to_db(db_config):
 
 def get_schools_by_province_and_cp(connection, province, cp, school_names_str=None):
     """获取指定省份、CP类型以及可选的指定院校的所有院校（仅 type='yuanxiao'）"""
-    base_query = """
-    SELECT DISTINCT school_id, school_name, ipgroup_name, ipgroup_id, nfa_uuid, cp
+    select_cols = [
+        'school_id', 'school_name', 'ipgroup_name', 'ipgroup_id', 'nfa_uuid', 'cp'
+    ]
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW COLUMNS FROM nfa_ipgroup")
+            rows = cursor.fetchall() or []
+            existing = set()
+            for r in rows:
+                try:
+                    existing.add(r.get('Field'))
+                except Exception:
+                    try:
+                        existing.add(r[0])
+                    except Exception:
+                        pass
+            if 'saler_group' in existing:
+                select_cols.append('saler_group')
+            if 'saler' in existing:
+                select_cols.append('saler')
+    except Exception:
+        pass
+
+    base_query = f"""
+    SELECT DISTINCT {', '.join(select_cols)}
     FROM nfa_ipgroup
     WHERE region = %s AND cp = %s AND type = %s
     """
@@ -326,6 +349,8 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                     'ipgroup_name': ml,
                     'ipgroup_id': '',
                     'nfa_uuid': '',
+                    'saler_group': '',
+                    'saler': '',
                     'date': f"{date_obj:%Y-%m-%d}",
                     'daily_95th_percentile_mbps': val,
                     'direction': direction,
@@ -345,6 +370,8 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                     'ipgroup_name': ml,
                     'ipgroup_id': '',
                     'nfa_uuid': '',
+                    'saler_group': '',
+                    'saler': '',
                     '95th_percentile_mbps': val,
                     'data_points': int(series.shape[0]),
                     'direction': direction
@@ -366,6 +393,8 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                     'ipgroup_name': s.get('ipgroup_name', ''),
                     'ipgroup_id': ipg,
                     'nfa_uuid': uuid,
+                    'saler_group': s.get('saler_group', ''),
+                    'saler': s.get('saler', ''),
                     'date': f"{date_obj:%Y-%m-%d}",
                     'daily_95th_percentile_mbps': val,
                     'direction': direction,
@@ -386,6 +415,8 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                     'ipgroup_name': s.get('ipgroup_name', ''),
                     'ipgroup_id': ipg,
                     'nfa_uuid': uuid,
+                    'saler_group': s.get('saler_group', ''),
+                    'saler': s.get('saler', ''),
                     '95th_percentile_mbps': val,
                     'data_points': int(series.shape[0]),
                     'direction': direction
@@ -431,6 +462,8 @@ def process_schools(connection, schools, start_time, end_time, direction, export
                     'ipgroup_name': school['ipgroup_name'],
                     'ipgroup_id': school['ipgroup_id'],
                     'nfa_uuid': school['nfa_uuid'],
+                    'saler_group': school.get('saler_group', ''),
+                    'saler': school.get('saler', ''),
                     'date': date_obj.strftime('%Y-%m-%d'),
                     'daily_95th_percentile_mbps': daily_95th_value,
                     'direction': direction,
@@ -457,6 +490,8 @@ def process_schools(connection, schools, start_time, end_time, direction, export
                 'ipgroup_name': school['ipgroup_name'],
                 'ipgroup_id': school['ipgroup_id'],
                 'nfa_uuid': school['nfa_uuid'],
+                'saler_group': school.get('saler_group', ''),
+                'saler': school.get('saler', ''),
                 '95th_percentile_mbps': percentile_95,
                 'data_points': len(speed_data),
                 'direction': direction

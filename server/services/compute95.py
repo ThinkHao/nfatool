@@ -50,6 +50,14 @@ def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_format
     artifacts: List[Dict[str, Any]] = []
     if df is None:
         return artifacts
+    # 确保导出包含 saler_group/saler 列（即使为空）
+    try:
+        for _col in ("saler_group", "saler"):
+            if _col not in df.columns:
+                df[_col] = ""
+    except Exception:
+        # 容错，不阻断导出
+        pass
     if df.empty:
         # 输出一个空CSV占位，至少包含列
         csv_path = safe_artifact_path(job_id, f"{filename_noext}.csv")
@@ -163,6 +171,9 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     else:
                         if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
                             group_cols = ['school_id','ipgroup_name','ipgroup_id','nfa_uuid']
+                            for _c in ('saler_group','saler'):
+                                if _c in df_daily.columns:
+                                    group_cols.append(_c)
                             df_excluded = (
                                 df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
                                         .mean()
@@ -222,6 +233,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                                     'ipgroup_name': '剩余院校汇总',
                                     'ipgroup_id': '',
                                     'nfa_uuid': '',
+                                    'saler_group': '',
+                                    'saler': '',
                                     'date': f"{date_obj:%Y-%m-%d}",
                                     'daily_95th_percentile_mbps': val,
                                     'direction': direction,
@@ -244,6 +257,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                                 'ipgroup_name': '剩余院校汇总',
                                 'ipgroup_id': '',
                                 'nfa_uuid': '',
+                                'saler_group': '',
+                                'saler': '',
                                 '95th_percentile_mbps': avg_val,
                                 'direction': direction
                             }])
@@ -257,6 +272,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                                 'ipgroup_name': '剩余院校汇总',
                                 'ipgroup_id': '',
                                 'nfa_uuid': '',
+                                'saler_group': '',
+                                'saler': '',
                                 'date': f"{date_obj:%Y-%m-%d}",
                                 'daily_95th_percentile_mbps': val,
                                 'direction': direction,
@@ -270,6 +287,8 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                             'ipgroup_name': '剩余院校汇总',
                             'ipgroup_id': '',
                             'nfa_uuid': '',
+                            'saler_group': '',
+                            'saler': '',
                             '95th_percentile_mbps': val,
                             'data_points': len(df_agg),
                             'direction': direction
@@ -338,6 +357,9 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     else:
                         if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
                             group_cols = ['school_id','ipgroup_name','ipgroup_id','nfa_uuid']
+                            for _c in ('saler_group','saler'):
+                                if _c in df_daily.columns:
+                                    group_cols.append(_c)
                             df = (
                                 df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
                                        .mean()
