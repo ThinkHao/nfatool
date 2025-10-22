@@ -332,6 +332,27 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
         df[['merge_value','merge_label']] = df.apply(
             lambda r: pd.Series(merge_map.get((r['ipgroup_id'], r['nfa_uuid']), ('', ''))), axis=1
         )
+        # 基于 merge_value 汇总 saler_group/saler（当且仅当唯一时保留）
+        _meta_tmp = {}
+        for s in schools:
+            mv, _ = _pair_to_merge(s)
+            sg = (s.get('saler_group') or '').strip()
+            sl = (s.get('saler') or '').strip()
+            bucket = _meta_tmp.setdefault(mv, {'sg': set(), 'sl': set()})
+            if sg:
+                bucket['sg'].add(sg)
+            if sl:
+                bucket['sl'].add(sl)
+        merge_meta = {}
+        from collections import Counter as _Ctr
+        for mv, sets in _meta_tmp.items():
+            sg = ''
+            sl = ''
+            if sets['sg']:
+                sg = _Ctr(list(sets['sg'])).most_common(1)[0][0]
+            if sets['sl']:
+                sl = _Ctr(list(sets['sl'])).most_common(1)[0][0]
+            merge_meta[mv] = {'saler_group': sg, 'saler': sl}
         # 先在相同时间点按 merge_value 聚合
         df_sum = df.groupby(['merge_value', 'merge_label', 'create_time'], as_index=False)[['recv_mbps','send_mbps']].sum()
         if export_daily:
@@ -344,13 +365,14 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                 else:
                     series = g['recv_mbps'] + g['send_mbps']
                 val = calculate_95th_from_series(series)
+                _meta = merge_meta.get(mv, {})
                 results.append({
                     'school_id': mv if eff_merge_key == 'school_id' else '',
                     'ipgroup_name': ml,
                     'ipgroup_id': '',
                     'nfa_uuid': '',
-                    'saler_group': '',
-                    'saler': '',
+                    'saler_group': _meta.get('saler_group', ''),
+                    'saler': _meta.get('saler', ''),
                     'date': f"{date_obj:%Y-%m-%d}",
                     'daily_95th_percentile_mbps': val,
                     'direction': direction,
@@ -365,13 +387,14 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
                 else:
                     series = g['recv_mbps'] + g['send_mbps']
                 val = calculate_95th_from_series(series)
+                _meta = merge_meta.get(mv, {})
                 results.append({
                     'school_id': mv if eff_merge_key == 'school_id' else '',
                     'ipgroup_name': ml,
                     'ipgroup_id': '',
                     'nfa_uuid': '',
-                    'saler_group': '',
-                    'saler': '',
+                    'saler_group': _meta.get('saler_group', ''),
+                    'saler': _meta.get('saler', ''),
                     '95th_percentile_mbps': val,
                     'data_points': int(series.shape[0]),
                     'direction': direction

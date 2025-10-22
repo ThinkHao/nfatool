@@ -89,6 +89,13 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     end_time = resolved_window["end_time"]
     window_label = resolved_window.get("label") or f"{start_time.split(' ')[0]}-{end_time.split(' ')[0]}"
     end_date = (end_time.split(' ')[0] if isinstance(end_time, str) and ' ' in end_time else str(end_time))
+    # 选定天数（含首尾，按日期粒度）
+    try:
+        _sd = pd.to_datetime(start_time).date()
+        _ed = pd.to_datetime(end_time).date()
+        total_days = max(1, (_ed - _sd).days + 1)
+    except Exception:
+        total_days = 1
 
     # Required params
     province = params.get("province")
@@ -174,11 +181,9 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                             for _c in ('saler_group','saler'):
                                 if _c in df_daily.columns:
                                     group_cols.append(_c)
-                            df_excluded = (
-                                df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
-                                        .mean()
-                                        .rename(columns={'daily_95th_percentile_mbps': '95th_percentile_mbps'})
-                            )
+                            tmp = df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps'].sum()
+                            tmp['95th_percentile_mbps'] = tmp['daily_95th_percentile_mbps'] / float(total_days)
+                            df_excluded = tmp.drop(columns=['daily_95th_percentile_mbps'])
                         else:
                             df_excluded = pd.DataFrame()
                 else:
@@ -251,7 +256,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                                 else:
                                     series = g['recv_mbps'] + g['send_mbps']
                                 vals.append(float(c95.calculate_95th_from_series(series)))
-                            avg_val = float(pd.Series(vals).mean()) if vals else 0.0
+                            avg_val = (float(pd.Series(vals).sum())/float(total_days)) if vals else 0.0
                             df_remaining = pd.DataFrame([{
                                 'school_id': '',
                                 'ipgroup_name': '剩余院校汇总',
@@ -314,7 +319,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                         df = df_daily
                     else:
                         if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
-                            avg_val = float(df_daily['daily_95th_percentile_mbps'].mean())
+                            avg_val = float(df_daily['daily_95th_percentile_mbps'].sum())/float(total_days)
                         else:
                             avg_val = 0.0
                         df = pd.DataFrame([{
@@ -360,11 +365,9 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                             for _c in ('saler_group','saler'):
                                 if _c in df_daily.columns:
                                     group_cols.append(_c)
-                            df = (
-                                df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps']
-                                       .mean()
-                                       .rename(columns={'daily_95th_percentile_mbps': '95th_percentile_mbps'})
-                            )
+                            tmp = df_daily.groupby(group_cols, as_index=False)['daily_95th_percentile_mbps'].sum()
+                            tmp['95th_percentile_mbps'] = tmp['daily_95th_percentile_mbps'] / float(total_days)
+                            df = tmp.drop(columns=['daily_95th_percentile_mbps'])
                         else:
                             df = pd.DataFrame()
                 else:
