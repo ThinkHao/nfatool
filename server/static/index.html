@@ -247,7 +247,9 @@
             <td>{{ r.started_at }}</td>
             <td>{{ r.finished_at }}</td>
             <td>
-              <a v-for="a in r.artifacts" :key="a.filename" :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(a.filename)" target="_blank">{{ a.filename }}</a>
+              <div v-for="a in r.artifacts" :key="a.filename">
+                <a :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(a.filename)" target="_blank">{{ a.filename }}</a>
+              </div>
             </td>
             <td>
               <button @click="deleteRun(r.id)">删除</button>
