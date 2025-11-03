@@ -74,3 +74,17 @@ class JobRunOut(BaseModel):
     error_message: Optional[str] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TaskPageOut(BaseModel):
+    items: list[TaskOut]
+    total: int
+    page: int
+    page_size: int
+
+
+class JobRunPageOut(BaseModel):
+    items: list[JobRunOut]
+    total: int
+    page: int
+    page_size: int

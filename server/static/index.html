@@ -28,6 +28,21 @@
       </div>
 
       <div class="row">
+        <input v-model="tasksQuery.q" placeholder="搜索任务名" />
+        <select v-model="tasksQuery.sort_by">
+          <option value="id">按ID</option>
+          <option value="name">按名称</option>
+          <option value="created_at">按创建时间</option>
+          <option value="updated_at">按更新时间</option>
+        </select>
+        <select v-model="tasksQuery.sort_order">
+          <option value="desc">降序</option>
+          <option value="asc">升序</option>
+        </select>
+        <button @click="applyTasksQuery">应用</button>
+      </div>
+
+      <div class="row">
         <input v-model="newTask.name" placeholder="任务名" />
         <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
         <label>
@@ -138,6 +153,24 @@
           </tr>
         </tbody>
       </table>
+      <div class="row">
+        <div>
+          <label>每页：
+            <select v-model.number="tasksPage.page_size" @change="changeTasksPageSize">
+              <option :value="10">10</option>
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+            </select>
+          </label>
+          <button @click="prevTasksPage">上一页</button>
+          <button @click="nextTasksPage">下一页</button>
+          <span style="margin-left:8px;">第 {{ tasksPage.page }} / {{ totalPages(tasksPage.total, tasksPage.page_size) }} 页（共 {{ tasksPage.total }} 条）</span>
+          <span style="margin-left:12px;">跳转到页：</span>
+          <input v-model.number="tasksPageJump" type="number" min="1" style="width:80px" />
+          <button @click="jumpTasksPage">跳转</button>
+        </div>
+      </div>
     </section>
 
     <section v-if="editTask">
@@ -232,7 +265,28 @@
 
     <section>
       <h2>运行记录</h2>
-      <button @click="loadRuns()">刷新</button>
+      <div class="row">
+        <button @click="loadRuns()">刷新</button>
+        <select v-model="runsQuery.status">
+          <option value="">全部状态</option>
+          <option value="pending">pending</option>
+          <option value="running">running</option>
+          <option value="succeeded">succeeded</option>
+          <option value="failed">failed</option>
+        </select>
+        <select v-model="runsQuery.sort_by">
+          <option value="started_at">按开始时间</option>
+          <option value="finished_at">按结束时间</option>
+          <option value="id">按ID</option>
+          <option value="status">按状态</option>
+        </select>
+        <select v-model="runsQuery.sort_order">
+          <option value="desc">降序</option>
+          <option value="asc">升序</option>
+        </select>
+        <button @click="applyRunsQuery">应用</button>
+        <button @click="clearRunsFilter">清除筛选</button>
+      </div>
       <table class="table">
         <thead>
           <tr>
@@ -257,8 +311,26 @@
           </tr>
         </tbody>
       </table>
+      <div class="row">
+        <div>
+          <label>每页：
+            <select v-model.number="runsPage.page_size" @change="changeRunsPageSize">
+              <option :value="10">10</option>
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+            </select>
+          </label>
+          <button @click="prevRunsPage">上一页</button>
+          <button @click="nextRunsPage">下一页</button>
+          <span style="margin-left:8px;">第 {{ runsPage.page }} / {{ totalPages(runsPage.total, runsPage.page_size) }} 页（共 {{ runsPage.total }} 条）</span>
+          <span style="margin-left:12px;">跳转到页：</span>
+          <input v-model.number="runsPageJump" type="number" min="1" style="width:80px" />
+          <button @click="jumpRunsPage">跳转</button>
+        </div>
+      </div>
     </section>
   </div>
-  <script src="/static/app.js?v=20250919-01"></script>
+  <script src="/static/app.js?v=20251103-01"></script>
 </body>
 </html>

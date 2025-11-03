@@ -14,6 +14,13 @@ createApp({
       health: '-',
       tasks: [],
       runs: [],
+      tasksPage: { items: [], total: 0, page: 1, page_size: 20 },
+      runsPage: { items: [], total: 0, page: 1, page_size: 20 },
+      runsFilterTaskId: null,
+      tasksQuery: { q: '', sort_by: 'id', sort_order: 'desc' },
+      runsQuery: { status: '', sort_by: 'started_at', sort_order: 'desc' },
+      tasksPageJump: 1,
+      runsPageJump: 1,
       newTask: {
         name: '',
         active: true,
@@ -118,9 +125,21 @@ createApp({
       this.health = data.status
     },
     async loadTasks() {
-      const res = await apiFetch('/api/tasks', {}, this.apiKey)
+      await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+    },
+    async loadTasksPage(page = 1, pageSize = 20) {
+      const params = new URLSearchParams()
+      params.set('page', String(page))
+      params.set('page_size', String(pageSize))
+      if (this.tasksQuery && this.tasksQuery.q) params.set('q', this.tasksQuery.q)
+      if (this.tasksQuery && this.tasksQuery.sort_by) params.set('sort_by', this.tasksQuery.sort_by)
+      if (this.tasksQuery && this.tasksQuery.sort_order) params.set('sort_order', this.tasksQuery.sort_order)
+      const res = await apiFetch('/api/tasks/page?' + params.toString(), {}, this.apiKey)
       if (!res.ok) { alert('任务列表加载失败'); return }
-      this.tasks = await res.json()
+      const data = await res.json()
+      this.tasksPage = { items: data.items || [], total: data.total || 0, page: data.page || page, page_size: data.page_size || pageSize }
+      this.tasks = this.tasksPage.items
+      this.tasksPageJump = this.tasksPage.page
     },
     async createTask() {
       // 先规范化自定义时间窗口
@@ -169,7 +188,11 @@ createApp({
       if (!confirm('确认删除?')) return
       const res = await apiFetch('/api/tasks/' + id, { method: 'DELETE' }, this.apiKey)
       if (!res.ok) { alert('删除失败'); return }
-      await this.loadTasks()
+      const curPage = this.tasksPage.page
+      await this.loadTasksPage(curPage, this.tasksPage.page_size)
+      if (this.tasks.length === 0 && curPage > 1) {
+        await this.loadTasksPage(curPage - 1, this.tasksPage.page_size)
+      }
     },
     async runTask(id) {
       const res = await apiFetch('/api/tasks/' + id + '/run', { method: 'POST' }, this.apiKey)
@@ -178,14 +201,71 @@ createApp({
       await this.loadRuns()
     },
     async viewRuns(taskId) {
-      const res = await apiFetch('/api/jobs?task_id=' + taskId, {}, this.apiKey)
-      if (!res.ok) { alert('加载失败'); return }
-      this.runs = await res.json()
+      this.runsFilterTaskId = taskId
+      await this.loadRunsPage(1, this.runsPage.page_size)
     },
     async loadRuns() {
-      const res = await apiFetch('/api/jobs', {}, this.apiKey)
+      await this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
+    },
+    async loadRunsPage(page = 1, pageSize = 20) {
+      const params = new URLSearchParams()
+      params.set('page', String(page))
+      params.set('page_size', String(pageSize))
+      if (this.runsFilterTaskId != null) params.set('task_id', String(this.runsFilterTaskId))
+      if (this.runsQuery && this.runsQuery.status) params.set('status', this.runsQuery.status)
+      if (this.runsQuery && this.runsQuery.sort_by) params.set('sort_by', this.runsQuery.sort_by)
+      if (this.runsQuery && this.runsQuery.sort_order) params.set('sort_order', this.runsQuery.sort_order)
+      const res = await apiFetch('/api/jobs/page?' + params.toString(), {}, this.apiKey)
       if (!res.ok) { alert('加载失败'); return }
-      this.runs = await res.json()
+      const data = await res.json()
+      this.runsPage = { items: data.items || [], total: data.total || 0, page: data.page || page, page_size: data.page_size || pageSize }
+      this.runs = this.runsPage.items
+      this.runsPageJump = this.runsPage.page
+    },
+    applyTasksQuery() {
+      this.loadTasksPage(1, this.tasksPage.page_size)
+    },
+    applyRunsQuery() {
+      this.loadRunsPage(1, this.runsPage.page_size)
+    },
+    clearRunsFilter() {
+      this.runsFilterTaskId = null
+      this.runsQuery.status = ''
+      this.loadRunsPage(1, this.runsPage.page_size)
+    },
+    nextTasksPage() {
+      const totalPages = this.totalPages(this.tasksPage.total, this.tasksPage.page_size)
+      if (this.tasksPage.page < totalPages) this.loadTasksPage(this.tasksPage.page + 1, this.tasksPage.page_size)
+    },
+    prevTasksPage() {
+      if (this.tasksPage.page > 1) this.loadTasksPage(this.tasksPage.page - 1, this.tasksPage.page_size)
+    },
+    nextRunsPage() {
+      const totalPages = this.totalPages(this.runsPage.total, this.runsPage.page_size)
+      if (this.runsPage.page < totalPages) this.loadRunsPage(this.runsPage.page + 1, this.runsPage.page_size)
+    },
+    prevRunsPage() {
+      if (this.runsPage.page > 1) this.loadRunsPage(this.runsPage.page - 1, this.runsPage.page_size)
+    },
+    changeTasksPageSize() {
+      this.loadTasksPage(1, this.tasksPage.page_size)
+    },
+    changeRunsPageSize() {
+      this.loadRunsPage(1, this.runsPage.page_size)
+    },
+    jumpTasksPage() {
+      const totalPages = this.totalPages(this.tasksPage.total, this.tasksPage.page_size)
+      let p = Number(this.tasksPageJump) || 1
+      if (p < 1) p = 1
+      if (p > totalPages) p = totalPages
+      this.loadTasksPage(p, this.tasksPage.page_size)
+    },
+    jumpRunsPage() {
+      const totalPages = this.totalPages(this.runsPage.total, this.runsPage.page_size)
+      let p = Number(this.runsPageJump) || 1
+      if (p < 1) p = 1
+      if (p > totalPages) p = totalPages
+      this.loadRunsPage(p, this.runsPage.page_size)
     },
     formatDateTime(dt) {
       if (!dt) return '-'
@@ -255,6 +335,10 @@ createApp({
                .replaceAll('{date}', date)
       return out
     },
+    totalPages(total, pageSize) {
+      const ps = Number(pageSize) || 1
+      return Math.max(1, Math.ceil((Number(total) || 0) / ps))
+    },
     filenamePreview(obj) {
       if (!obj) return ''
       const tpl = obj.output_filename_template || ''
@@ -309,7 +393,11 @@ createApp({
           alert(`删除失败: ${res.status} ${text}`)
           return
         }
-        await this.loadRuns()
+        const curPage = this.runsPage.page
+        await this.loadRunsPage(curPage, this.runsPage.page_size)
+        if (this.runs.length === 0 && curPage > 1) {
+          await this.loadRunsPage(curPage - 1, this.runsPage.page_size)
+        }
       } catch (e) {
         console.error('删除请求异常', e)
         alert('删除请求异常：' + e)
@@ -329,8 +417,8 @@ createApp({
   },
   mounted() {
     this.checkHealth()
-    this.loadTasks()
-    this.loadRuns()
+    this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+    this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
     this.$nextTick(() => { if (this.newTask.window_selector === 'custom') this.initRangePickerNew() })
   }
 }).mount('#app')

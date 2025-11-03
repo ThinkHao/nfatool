@@ -36,6 +36,10 @@ def _migrate_sqlite():
                 cols = [row[1] for row in res.fetchall()]
                 if 'kind' not in cols:
                     conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN kind VARCHAR(20) DEFAULT 'one_off'")
+                # Create helpful indexes (idempotent)
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_job_runs_task_id ON job_runs (task_id)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_job_runs_started_at ON job_runs (started_at)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks (name)")
     except Exception:
         # Best-effort; ignore migration errors to avoid blocking startup
         pass

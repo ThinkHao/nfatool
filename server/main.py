@@ -15,7 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import get_settings, BASE_DIR
 from .db import init_db, session_scope
 from .models import Task, JobRun
-from .schemas import TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut
+from .schemas import TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut
 from .security import api_key_auth
 from .services.scheduler import (
     create_ad_hoc_job_run,
@@ -217,6 +217,119 @@ async def list_tasks():
                 next_run_time=_get_next_run_time(t.id),
             ))
         return out
+
+
+@app.get("/api/jobs/page", response_model=JobRunPageOut, dependencies=[Depends(api_key_auth)])
+async def list_jobs_page(
+    task_id: Optional[int] = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    status: Optional[str] = Query(default=None),
+    sort_by: Optional[str] = Query(default="started_at"),
+    sort_order: Optional[str] = Query(default="desc")
+):
+    with session_scope() as s:
+        base = s.query(JobRun)
+        if task_id is not None:
+            base = base.filter(JobRun.task_id == task_id)
+        if status:
+            try:
+                base = base.filter(JobRun.status == status)
+            except Exception:
+                pass
+        total = base.count()
+        # sorting
+        sort_field = (sort_by or "started_at").lower()
+        order = (sort_order or "desc").lower()
+        if sort_field == "finished_at":
+            primary = JobRun.finished_at
+        elif sort_field == "id":
+            primary = JobRun.id
+        elif sort_field == "status":
+            primary = JobRun.status
+        else:
+            primary = JobRun.started_at
+        if order == "asc":
+            order_clause = primary.asc()
+        else:
+            order_clause = primary.desc()
+        # keep IS NULL ordering first for started_at to be consistent
+        if sort_field == "started_at":
+            rows = base.order_by((JobRun.started_at.is_(None)).asc(), order_clause).offset((page - 1) * page_size).limit(page_size).all()
+        else:
+            rows = base.order_by(order_clause).offset((page - 1) * page_size).limit(page_size).all()
+        items: list[JobRunOut] = []
+        for r in rows:
+            artifacts = []
+            try:
+                artifacts = json.loads(r.artifacts) if r.artifacts else []
+            except Exception:
+                artifacts = []
+            items.append(JobRunOut(
+                id=r.id,
+                task_id=r.task_id,
+                status=r.status,
+                started_at=r.started_at,
+                finished_at=r.finished_at,
+                resolved_window=json.loads(r.resolved_window) if r.resolved_window else None,
+                resolved_params=json.loads(r.resolved_params) if r.resolved_params else None,
+                artifacts=artifacts,
+                log_path=r.log_path,
+                error_message=r.error_message,
+            ))
+        return JobRunPageOut(items=items, total=total, page=page, page_size=page_size)
+
+@app.get("/api/tasks/page", response_model=TaskPageOut, dependencies=[Depends(api_key_auth)])
+async def list_tasks_page(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=200),
+    q: Optional[str] = Query(default=None),
+    sort_by: Optional[str] = Query(default="id"),
+    sort_order: Optional[str] = Query(default="desc")
+):
+    with session_scope() as s:
+        query = s.query(Task)
+        # filter by name contains
+        if q:
+            try:
+                query = query.filter(Task.name.like(f"%{q}%"))
+            except Exception:
+                pass
+        total = query.count()
+        # sorting
+        sort_field = (sort_by or "id").lower()
+        order = (sort_order or "desc").lower()
+        order_clause = Task.id.desc()
+        if sort_field == "id":
+            order_clause = Task.id.desc() if order != "asc" else Task.id.asc()
+        elif sort_field == "name":
+            order_clause = Task.name.desc() if order != "asc" else Task.name.asc()
+        elif sort_field == "created_at":
+            order_clause = Task.created_at.desc() if order != "asc" else Task.created_at.asc()
+        elif sort_field == "updated_at":
+            order_clause = Task.updated_at.desc() if order != "asc" else Task.updated_at.asc()
+        rows = query.order_by(order_clause).offset((page - 1) * page_size).limit(page_size).all()
+        items: list[TaskOut] = []
+        for t in rows:
+            items.append(TaskOut(
+                id=t.id,
+                name=t.name,
+                active=t.active,
+                kind=t.kind,
+                schedule_type=t.schedule_type,
+                schedule_expr=t.schedule_expr,
+                schedule_time_of_day=t.schedule_time_of_day,
+                timezone=t.timezone,
+                window_selector=t.window_selector,
+                window_params=(json.loads(t.window_params) if t.window_params else None),
+                params=(json.loads(t.params) if t.params else {}),
+                export_formats=(json.loads(t.export_formats) if t.export_formats else ["csv"]),
+                output_filename_template=t.output_filename_template,
+                created_at=t.created_at,
+                updated_at=t.updated_at,
+                next_run_time=_get_next_run_time(t.id),
+            ))
+        return TaskPageOut(items=items, total=total, page=page, page_size=page_size)
 
 
 @app.get("/api/tasks/{task_id}", response_model=TaskOut, dependencies=[Depends(api_key_auth)])
