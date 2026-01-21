@@ -123,6 +123,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     settlement_mode = params.get("settlement_mode")  # None -> preserve prior behavior
     combine_v4_v6 = bool(params.get("combine_v4_v6", False))
     merge_key = params.get("merge_key")
+    monthly_aggregate = bool(params.get("monthly_aggregate", False))
 
     # Prefer env MySQL settings; fallback to db_config.ini if provided in params
     db_cfg = None
@@ -154,6 +155,59 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
             txt = safe_artifact_path(job_id, f"{_build_base_filename(params, window_label, output_filename_template, end_date)}-no_data.txt")
             txt.write_text("No schools matched the filter.", encoding="utf-8")
             artifacts.append({"filename": txt.name, "size": txt.stat().st_size, "path": str(txt)})
+            return artifacts
+
+        # Helper: split [start_time, end_time] into calendar months
+        def _month_ranges(start_s: str, end_s: str):
+            out = []
+            s = pd.to_datetime(start_s)
+            e = pd.to_datetime(end_s)
+            cur = pd.Timestamp(year=s.year, month=s.month, day=1, hour=0, minute=0, second=0)
+            # ensure first month covers from start_s if mid-month
+            while cur <= e:
+                if cur.month == 12:
+                    next_first = pd.Timestamp(year=cur.year + 1, month=1, day=1)
+                else:
+                    next_first = pd.Timestamp(year=cur.year, month=cur.month + 1, day=1)
+                seg_start = max(cur, s)
+                seg_end = min(next_first - pd.Timedelta(seconds=1), e)
+                out.append({
+                    'label': f"{cur.year}-{cur.month:02d}",
+                    'start': f"{seg_start:%Y-%m-%d %H:%M:%S}",
+                    'end': f"{seg_end:%Y-%m-%d %H:%M:%S}",
+                })
+                cur = next_first
+            return out
+
+        if monthly_aggregate:
+            # 忽略 export_daily，改为输出按自然月聚合的行
+            base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
+            rows_all: list[dict] = []
+            for rg in _month_ranges(start_time, end_time):
+                month_rows = c95.process_schools_batched(
+                    conn, schools,
+                    pd.to_datetime(rg['start']), pd.to_datetime(rg['end']),
+                    direction, False,
+                    batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                )
+                if month_rows:
+                    for it in month_rows:
+                        it['month'] = rg['label']
+                    rows_all.extend(month_rows)
+            dfm = _to_dataframe(rows_all)
+            if not dfm.empty:
+                sort_keys = []
+                if 'month' in dfm.columns:
+                    sort_keys.append('month')
+                if 'cp' in dfm.columns:
+                    sort_keys.append('cp')
+                # 名称列兼容
+                name_col = 'school_name' if 'school_name' in dfm.columns else ('ipgroup_name' if 'ipgroup_name' in dfm.columns else None)
+                if name_col:
+                    sort_keys.append(name_col)
+                if sort_keys:
+                    dfm = dfm.sort_values(by=sort_keys, kind='stable')
+            artifacts += _export_df(dfm, job_id, f"{base_name}-monthly", export_formats)
             return artifacts
 
         if exclude_school:

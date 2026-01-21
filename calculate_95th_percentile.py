@@ -15,6 +15,7 @@ import os
 import sys
 import logging
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 设置日志
 logging.basicConfig(
@@ -26,17 +27,20 @@ logger = logging.getLogger("95值计算工具")
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='计算指定省份、指定CP类型、指定时间范围内所有院校的95值')
+    parser = argparse.ArgumentParser(description='计算指定省份、指定CP类型、指定时间范围或年度每月的95值')
     parser.add_argument('--province', '-p', required=True, help='指定省份，例如：四川')
-    parser.add_argument('--cp', '-c', required=True, help='指定CP类型，例如：教育网')
-    parser.add_argument('--start-time', '-s', required=True, help='开始时间，格式：YYYY-MM-DD HH:MM:SS')
-    parser.add_argument('--end-time', '-e', required=True, help='结束时间，格式：YYYY-MM-DD HH:MM:SS')
-    parser.add_argument('--config', default='db_config.ini', help='数据库配置文件路径')
+    parser.add_argument('--cp', '-c', required=False, help='指定CP类型，例如：教育网；如不提供且指定 --year，则对该省份所有CP分别计算')
+    parser.add_argument('--year', type=int, help='指定年份，启用按月计算该年度每个月的95值')
+    parser.add_argument('--start-time', '-s', required=False, help='开始时间，格式：YYYY-MM-DD HH:MM:SS（在未指定 --year 时必需）')
+    parser.add_argument('--end-time', '-e', required=False, help='结束时间，格式：YYYY-MM-DD HH:MM:SS（在未指定 --year 时必需）')
+    parser.add_argument('--config', default='db_config.ini', help='数据库配置文件路径（若未提供 --config-rel/--config-data 时使用）')
+    parser.add_argument('--config-rel', default=None, help='关系库配置文件（nfa_ipgroup 等）')
+    parser.add_argument('--config-data', default=None, help='流量库配置文件（nfa_ip_group_speed_logs_5m 等）')
     parser.add_argument('--output', '-o', default='95th_percentile_results.csv', help='输出结果文件路径')
     parser.add_argument('--direction', '-d', default='both', choices=['send', 'recv', 'both'], 
                         help='流量方向：send(发送)、recv(接收)或both(双向)')
     parser.add_argument('--school', '-sc', help='指定院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学')
-    parser.add_argument('--export-daily', action='store_true', help='导出每日95值，而不是整个周期的汇总95值')
+    parser.add_argument('--export-daily', action='store_true', help='导出每日95值，而不是整个周期的汇总95值（仅非年度模式）')
     parser.add_argument('--exclude-school', '-esc', help='排除的院校名称，多个院校用逗号分隔，例如：电子科技大学,四川大学')
     parser.add_argument('--sortby', help='按该字段排序输出，例如：95th_percentile_mbps、daily_95th_percentile_mbps、ipgroup_name 等')
     parser.add_argument('--sort-order', choices=['asc', 'desc'], default='desc', help='排序顺序：asc（升序）或 desc（降序），默认 desc')
@@ -44,9 +48,12 @@ def parse_args():
                         help='将所有符合条件的院校在相同时间点上汇总（recv/send 求和）后再计算95值；配合 --export-daily 则输出“全市汇总”的日95。')
     parser.add_argument('--batch-size', type=int, default=200,
                         help='批量拉取日志时每批包含的 (ipgroup_id, nfa_uuid) 数量，默认 200')
+    parser.add_argument('--group-by-school', action='store_true',
+                        help='按 region+cp+school_name 聚合（跨 ipgroup 历史实例累加）后计算95值')
+    parser.add_argument('--jobs', type=int, default=1, help='年度模式并行处理月份的线程数，默认 1（不并行）')
     return parser.parse_args()
 
-def load_db_config(config_file):
+def load_db_config(config_file, section='DATABASE'):
     """加载数据库配置"""
     if not os.path.exists(config_file):
         logger.error(f"配置文件 {config_file} 不存在")
@@ -57,12 +64,12 @@ def load_db_config(config_file):
     config = configparser.ConfigParser()
     config.read(config_file)
     return {
-        'host': config.get('DATABASE', 'host'),
-        'port': config.getint('DATABASE', 'port'),
-        'user': config.get('DATABASE', 'user'),
-        'password': config.get('DATABASE', 'password'),
-        'db': config.get('DATABASE', 'db'),
-        'charset': config.get('DATABASE', 'charset', fallback='utf8mb4')
+        'host': config.get(section, 'host'),
+        'port': config.getint(section, 'port'),
+        'user': config.get(section, 'user'),
+        'password': config.get(section, 'password'),
+        'db': config.get(section, 'db'),
+        'charset': config.get(section, 'charset', fallback='utf8mb4')
     }
 
 def create_default_config(config_file):
@@ -96,14 +103,74 @@ def connect_to_db(db_config):
         logger.error(f"数据库连接失败: {e}")
         sys.exit(1)
 
+def _pick_section(config: configparser.ConfigParser, preferred_sections):
+    # 返回第一个存在的节；若都不存在且仅有一个节，则返回该节；否则返回 None
+    if preferred_sections:
+        for s in preferred_sections:
+            if config.has_section(s):
+                return s
+    sections = config.sections()
+    if len(sections) == 1:
+        return sections[0]
+    return None
+
+def load_db_config_flexible(config_file: str, preferred_sections=()):
+    if not os.path.exists(config_file):
+        logger.error(f"配置文件 {config_file} 不存在")
+        create_default_config(config_file)
+        logger.info(f"已创建默认配置文件 {config_file}，请修改后重新运行")
+        sys.exit(1)
+    cfg = configparser.ConfigParser()
+    cfg.read(config_file)
+    section = _pick_section(cfg, preferred_sections or ('DATABASE',))
+    if not section:
+        logger.error(f"配置文件 {config_file} 未找到可用节名，请在其中添加 [DATABASE] 或 [REL_DATABASE]/[DATA_DATABASE]。现有节: {cfg.sections()}")
+        sys.exit(1)
+    return {
+        'host': cfg.get(section, 'host'),
+        'port': cfg.getint(section, 'port'),
+        'user': cfg.get(section, 'user'),
+        'password': cfg.get(section, 'password'),
+        'db': cfg.get(section, 'db'),
+        'charset': cfg.get(section, 'charset', fallback='utf8mb4')
+    }
+
+def _load_dual_db_configs(args):
+    cfg_rel = None
+    cfg_data = None
+    if args.config_rel:
+        cfg_rel = load_db_config_flexible(args.config_rel, ('REL_DATABASE', 'DATABASE'))
+    if args.config_data:
+        cfg_data = load_db_config_flexible(args.config_data, ('DATA_DATABASE', 'DATABASE'))
+    if cfg_rel and cfg_data:
+        return cfg_rel, cfg_data
+    # 在单个 ini 中尝试独立段
+    base_ini = args.config or 'db_config.ini'
+    if os.path.exists(base_ini):
+        cp = configparser.ConfigParser()
+        cp.read(base_ini)
+        if cp.has_section('REL_DATABASE'):
+            cfg_rel = load_db_config(base_ini, section='REL_DATABASE')
+        if cp.has_section('DATA_DATABASE'):
+            cfg_data = load_db_config(base_ini, section='DATA_DATABASE')
+    # 回退到单一 DATABASE 段
+    if not cfg_rel:
+        cfg_rel = load_db_config_flexible(base_ini, ('REL_DATABASE', 'DATABASE'))
+    if not cfg_data:
+        cfg_data = load_db_config_flexible(base_ini, ('DATA_DATABASE', 'DATABASE'))
+    return cfg_rel, cfg_data
+
 def get_schools_by_province_and_cp(connection, province, cp, school_names_str=None):
     """获取指定省份、CP类型以及可选的指定院校的所有院校（仅 type='yuanxiao'）"""
     base_query = """
-    SELECT DISTINCT school_id, school_name, ipgroup_name, ipgroup_id, nfa_uuid
+    SELECT DISTINCT school_id, school_name, ipgroup_name, ipgroup_id, nfa_uuid, cp, region
     FROM nfa_ipgroup
-    WHERE region = %s AND cp = %s AND type = %s
+    WHERE region = %s AND type = %s
     """
-    params = [province, cp, 'yuanxiao']
+    params = [province, 'yuanxiao']
+    if cp:
+        base_query += " AND cp = %s"
+        params.append(cp)
 
     if school_names_str:
         school_names_list = [name.strip() for name in school_names_str.split(',') if name.strip()]
@@ -111,12 +178,12 @@ def get_schools_by_province_and_cp(connection, province, cp, school_names_str=No
             placeholders = ', '.join(['%s'] * len(school_names_list))
             base_query += f" AND school_name IN ({placeholders})"
             params.extend(school_names_list)
-            logger.info(f"筛选条件：省份='{province}', CP='{cp}', type='yuanxiao', 指定院校='{school_names_str}'")
+            logger.info(f"筛选条件：省份='{province}', CP='{cp or 'ALL'}', type='yuanxiao', 指定院校='{school_names_str}'")
         else:
             logger.warning("提供的 --school 参数值为空或格式不正确，将忽略院校名称筛选。")
-            logger.info(f"筛选条件：省份='{province}', CP='{cp}', type='yuanxiao' (未指定有效院校)")
+            logger.info(f"筛选条件：省份='{province}', CP='{cp or 'ALL'}', type='yuanxiao' (未指定有效院校)")
     else:
-        logger.info(f"筛选条件：省份='{province}', CP='{cp}', type='yuanxiao' (未指定院校)")
+        logger.info(f"筛选条件：省份='{province}', CP='{cp or 'ALL'}', type='yuanxiao' (未指定院校)")
 
     query = base_query
     
@@ -303,6 +370,30 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
             })
     return results
 
+def compute_month_rows(data_cfg: dict, schools, start_s: str, end_s: str, direction: str, batch_size: int,
+                       grouped: bool, cp_map: dict, month_label: str):
+    conn = connect_to_db(data_cfg)
+    try:
+        rows = []
+        if grouped:
+            rows = compute_grouped_results_batched(
+                conn, schools, start_s, end_s, direction,
+                export_daily=False, batch_size=batch_size
+            )
+            for item in rows:
+                item['month'] = month_label
+        else:
+            batch_results = process_schools_batched(
+                conn, schools, start_s, end_s, direction, export_daily=False, batch_size=batch_size
+            )
+            for item in batch_results:
+                item['month'] = month_label
+                item['cp'] = cp_map.get((item.get('ipgroup_id'), item.get('nfa_uuid')))
+            rows = batch_results
+        return rows
+    finally:
+        conn.close()
+
 # 新增：通用处理与保存函数，避免重复代码
 def _split_names_to_set(names_str):
     if not names_str:
@@ -486,6 +577,139 @@ def aggregate_all_and_compute(connection, schools, start_time, end_time, directi
             'direction': direction
         }]
 
+def _group_pairs_by_school(schools):
+    """
+    将院校按 (region, cp, school_name) 归组，返回 { (region, cp, school_name): [(ipgroup_id, nfa_uuid), ...] }
+    """
+    groups = {}
+    for s in schools:
+        region = s.get('region') or ''
+        cp = s.get('cp') or ''
+        name = s.get('school_name') or (s.get('ipgroup_name') or '')
+        key = (region, cp, name)
+        groups.setdefault(key, []).append((s['ipgroup_id'], s['nfa_uuid']))
+    return groups
+
+def _compute_95_from_agg_df(df_agg: pd.DataFrame, direction: str) -> tuple[float, int]:
+    if df_agg.empty:
+        return 0.0, 0
+    df_agg = df_agg.copy()
+    df_agg['recv_mbps'] = df_agg['recv'] * 8 / 60 / 1024 / 1024
+    df_agg['send_mbps'] = df_agg['send'] * 8 / 60 / 1024 / 1024
+    if direction == 'recv':
+        series = df_agg['recv_mbps']
+    elif direction == 'send':
+        series = df_agg['send_mbps']
+    else:
+        series = df_agg['recv_mbps'] + df_agg['send_mbps']
+    return calculate_95th_from_series(series), int(series.shape[0])
+
+def compute_grouped_results(connection, schools, start_time, end_time, direction):
+    """按 (region, cp, school_name) 聚合不同 ipgroup 的时间序列后计算 95 值。"""
+    groups = _group_pairs_by_school(schools)
+    rows = []
+    for (region, cp, name), pairs in groups.items():
+        df_agg = aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time)
+        val, cnt = _compute_95_from_agg_df(df_agg, direction)
+        rows.append({
+            'region': region,
+            'cp': cp,
+            'school_name': name,
+            'ipgroup_name': name,
+            '95th_percentile_mbps': val,
+            'data_points': cnt,
+            'direction': direction
+        })
+    return rows
+
+def compute_grouped_results_batched(connection, schools, start_time, end_time, direction, export_daily=False, batch_size=200):
+    """
+    更高效的分组聚合：一次（分批）拉取所有学校的原始5分钟数据，再在内存中按
+    (region, cp, school_name) 与时间进行聚合，最后计算95值。
+    """
+    if not schools:
+        return []
+    pairs = [(s['ipgroup_id'], s['nfa_uuid']) for s in schools]
+    # 建立映射 (ipgroup_id, nfa_uuid) -> (region, cp, school_name)
+    meta_rows = []
+    for s in schools:
+        meta_rows.append({
+            'ipgroup_id': s['ipgroup_id'],
+            'nfa_uuid': s['nfa_uuid'],
+            'region': s.get('region') or '',
+            'cp': s.get('cp') or '',
+            'school_name': s.get('school_name') or (s.get('ipgroup_name') or '')
+        })
+    df_meta = pd.DataFrame(meta_rows)
+    df_raw = fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batch_size=batch_size)
+    if df_raw.empty:
+        return []
+    # 关联元数据，得到分组键
+    df = df_raw.merge(df_meta, on=['ipgroup_id', 'nfa_uuid'], how='left')
+    # 转换 Mbps
+    df['recv_mbps'] = df['recv'] * 8 / 60 / 1024 / 1024 if 'recv' in df.columns else 0.0
+    df['send_mbps'] = df['send'] * 8 / 60 / 1024 / 1024 if 'send' in df.columns else 0.0
+    # 先按时间点聚合（同一院校同一CP下不同实例在同一 create_time 上求和）
+    if direction == 'recv':
+        df['metric'] = df['recv_mbps']
+    elif direction == 'send':
+        df['metric'] = df['send_mbps']
+    else:
+        df['metric'] = df['recv_mbps'] + df['send_mbps']
+    df_agg_time = df.groupby(['region', 'cp', 'school_name', 'create_time'], as_index=False)['metric'].sum()
+    results = []
+    if export_daily:
+        df_agg_time['date'] = df_agg_time['create_time'].dt.date
+        for (region, cp, name, date_obj), g in df_agg_time.groupby(['region', 'cp', 'school_name', 'date'], sort=False):
+            val = calculate_95th_from_series(g['metric'])
+            results.append({
+                'region': region,
+                'cp': cp,
+                'school_name': name,
+                'ipgroup_name': name,
+                'date': date_obj.strftime('%Y-%m-%d'),
+                'daily_95th_percentile_mbps': val,
+                'direction': direction,
+                'data_points_daily': int(g['metric'].shape[0])
+            })
+    else:
+        for (region, cp, name), g in df_agg_time.groupby(['region', 'cp', 'school_name'], sort=False):
+            val = calculate_95th_from_series(g['metric'])
+            results.append({
+                'region': region,
+                'cp': cp,
+                'school_name': name,
+                'ipgroup_name': name,
+                '95th_percentile_mbps': val,
+                'data_points': int(g['metric'].shape[0]),
+                'direction': direction
+            })
+    return results
+
+def compute_grouped_results_daily(connection, schools, start_time, end_time, direction):
+    """按 (region, cp, school_name) 聚合后按天输出 95 值。"""
+    groups = _group_pairs_by_school(schools)
+    rows = []
+    for (region, cp, name), pairs in groups.items():
+        df_agg = aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time)
+        if df_agg.empty:
+            continue
+        df_agg = df_agg.copy()
+        df_agg['date'] = pd.to_datetime(df_agg['create_time']).dt.date
+        for date_obj, g in df_agg.groupby('date'):
+            val, cnt = _compute_95_from_agg_df(g, direction)
+            rows.append({
+                'region': region,
+                'cp': cp,
+                'school_name': name,
+                'ipgroup_name': name,
+                'date': date_obj.strftime('%Y-%m-%d'),
+                'daily_95th_percentile_mbps': val,
+                'direction': direction,
+                'data_points_daily': cnt
+            })
+    return rows
+
 def save_results(results, output_path, is_daily, direction, start_time, end_time, extra_log_prefix="", sort_by=None, sort_order='desc'):
     if not results:
         logger.warning(f"{extra_log_prefix}没有计算任何结果，跳过写入文件。")
@@ -519,32 +743,129 @@ def save_results(results, output_path, is_daily, direction, start_time, end_time
 def main():
     """主函数"""
     args = parse_args()
-
     logger.info(f"脚本模式: {'导出每日95值' if args.export_daily else '计算周期汇总95值'}")
-    
-    # 解析时间
+
+    # 年度模式：按月导出每个院校、每个CP的95值
+    def _month_ranges(year: int):
+        ranges = []
+        for m in range(1, 13):
+            start_dt = datetime(year, m, 1, 0, 0, 0)
+            if m == 12:
+                next_first = datetime(year + 1, 1, 1, 0, 0, 0)
+            else:
+                next_first = datetime(year, m + 1, 1, 0, 0, 0)
+            end_dt = next_first - timedelta(seconds=1)
+            ranges.append({
+                'label': f"{year}-{m:02d}",
+                'start': start_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                'end': end_dt.strftime('%Y-%m-%d %H:%M:%S')
+            })
+        return ranges
+
+    # 准备 DB 连接（关系库 + 流量库）
+    rel_cfg, data_cfg = _load_dual_db_configs(args)
+    rel_conn = connect_to_db(rel_cfg)
+    data_conn = connect_to_db(data_cfg)
+
     try:
-        start_time = datetime.strptime(args.start_time, '%Y-%m-%d %H:%M:%S')
-        end_time = datetime.strptime(args.end_time, '%Y-%m-%d %H:%M:%S')
-    except ValueError:
-        logger.error("时间格式错误，请使用 YYYY-MM-DD HH:MM:SS 格式")
-        sys.exit(1)
-    
-    # 加载数据库配置
-    db_config = load_db_config(args.config)
-    
-    # 连接数据库
-    connection = connect_to_db(db_config)
-    
-    try:
+        if args.year:
+            # 年度模式无需日导出
+            if args.export_daily:
+                logger.warning("年度模式下忽略 --export-daily 参数：将按月导出。")
+            # 获取学校（可跨CP）
+            schools = get_schools_by_province_and_cp(rel_conn, args.province, args.cp, args.school)
+            if not schools:
+                logger.warning(f"未找到符合条件的院校 (省份='{args.province}', CP='{args.cp or 'ALL'}')")
+                sys.exit(0)
+            # 排除名单
+            if args.exclude_school:
+                exclude_set = _split_names_to_set(args.exclude_school)
+                if exclude_set:
+                    schools = [s for s in schools if s.get('school_name') not in exclude_set]
+            # 建立 (ipgroup_id, nfa_uuid) -> cp 的映射
+            cp_map = {(s['ipgroup_id'], s['nfa_uuid']): s.get('cp') for s in schools}
+            all_rows = []
+            ranges = list(_month_ranges(args.year))
+            if args.jobs and args.jobs > 1:
+                logger.info(f"年度模式启用并行：{args.jobs} 线程")
+                with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+                    futures = []
+                    for rg in ranges:
+                        futures.append(ex.submit(
+                            compute_month_rows,
+                            data_cfg,
+                            schools,
+                            rg['start'],
+                            rg['end'],
+                            args.direction,
+                            args.batch_size,
+                            args.group_by_school,
+                            cp_map,
+                            rg['label']
+                        ))
+                    for fut in as_completed(futures):
+                        try:
+                            rows = fut.result()
+                            if rows:
+                                all_rows.extend(rows)
+                        except Exception as e:
+                            logger.error(f"并行月份任务失败: {e}")
+            else:
+                for rg in ranges:
+                    month_label = rg['label']
+                    start_s, end_s = rg['start'], rg['end']
+                    logger.info(f"[{month_label}] 开始计算: {start_s} ~ {end_s}")
+                    rows = compute_month_rows(
+                        data_cfg, schools, start_s, end_s, args.direction,
+                        args.batch_size, args.group_by_school, cp_map, month_label
+                    )
+                    all_rows.extend(rows)
+            if not all_rows:
+                logger.warning("全年无任何计算结果。")
+                sys.exit(0)
+            df = pd.DataFrame(all_rows)
+            # 排序（并行时确保输出稳定按月/学校/CP）
+            sort_keys = ['month']
+            if 'cp' in df.columns:
+                sort_keys.append('cp')
+            if 'school_name' in df.columns:
+                sort_keys.append('school_name')
+            elif 'ipgroup_name' in df.columns:
+                sort_keys.append('ipgroup_name')
+            df = df.sort_values(by=sort_keys, kind='stable')
+            # 调整列顺序，便于查看
+            preferred = ['month', 'cp', 'school_name', 'ipgroup_name', 'school_id', 'ipgroup_id', 'nfa_uuid', '95th_percentile_mbps', 'data_points', 'direction']
+            cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+            df = df[cols]
+            # 输出文件名
+            out_path = args.output
+            if out_path == '95th_percentile_results.csv':
+                out_path = f"95th_percentile_{args.province}_{args.year}_monthly.csv"
+            df.to_csv(out_path, index=False, encoding='utf-8-sig')
+            logger.info(f"年度按月结果已保存到 {out_path}")
+            return
+
+        # 非年度模式：要求 cp、start/end 存在
+        if not args.cp:
+            logger.error("未指定 --year 时，必须提供 --cp。")
+            sys.exit(1)
+        if not args.start_time or not args.end_time:
+            logger.error("未指定 --year 时，必须提供 --start-time 与 --end-time。")
+            sys.exit(1)
+        try:
+            start_time = datetime.strptime(args.start_time, '%Y-%m-%d %H:%M:%S')
+            end_time = datetime.strptime(args.end_time, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            logger.error("时间格式错误，请使用 YYYY-MM-DD HH:MM:SS 格式")
+            sys.exit(1)
+
         # 获取符合条件的院校（先按 --school 过滤，再根据 --exclude-school 划分两组）
-        schools = get_schools_by_province_and_cp(connection, args.province, args.cp, args.school)
+        schools = get_schools_by_province_and_cp(rel_conn, args.province, args.cp, args.school)
         
         if not schools:
-            warning_msg = f"未找到符合条件的院校 (省份='{args.province}', CP='{args.cp}'"
+            warning_msg = f"未找到符合条件的院校 (省份='{args.province}', CP='{args.cp}')"
             if args.school:
                 warning_msg += f", 院校='{args.school}'"
-            warning_msg += ")"
             logger.warning(warning_msg)
             sys.exit(0)
         
@@ -566,8 +887,8 @@ def main():
             # 1) 排除组：逐校计算（保持原有行为）
             if excluded_schools:
                 logger.info(f"将对排除院校单独计算，共 {len(excluded_schools)} 所。名单: {', '.join(sorted(exclude_set))}")
-                results_excluded = process_schools(connection, excluded_schools, start_time, end_time, args.direction, args.export_daily)
-                save_results(results_excluded, out_excluded, args.export_daily, args.direction, start_time, end_time, extra_log_prefix="[排除组] ", sort_by=args.sortby, sort_order=args.sort_order)
+                results_excluded = process_schools(data_conn, excluded_schools, args.start_time, args.end_time, args.direction, args.export_daily)
+                save_results(results_excluded, out_excluded, args.export_daily, args.direction, args.start_time, args.end_time, extra_log_prefix="[排除组] ", sort_by=args.sortby, sort_order=args.sort_order)
             else:
                 logger.warning("未在查询结果中找到需要排除并单独计算的院校，跳过排除组计算。")
 
@@ -582,7 +903,6 @@ def main():
                 name_list = [n for n in name_list if n]
                 name_counter = Counter(name_list)
                 if name_counter:
-                    # 打印带数量的名单，例如：学校A x2, 学校B
                     items = sorted(name_counter.items(), key=lambda x: x[0])
                     pretty = ", ".join([f"{n} x{c}" if c > 1 else n for n, c in items])
                     logger.info("剩余院校名单(同名合并统计): " + pretty)
@@ -593,7 +913,6 @@ def main():
                 # 将剩余院校名单导出为TXT文件
                 out_remaining_names = f"{root}_remaining_names.txt"
                 try:
-                    # TXT 导出：优先 ipgroup_name，其次 school_name；同名合并并显示数量（>1 则追加 xN）
                     items = sorted(name_counter.items(), key=lambda x: x[0])
                     with open(out_remaining_names, 'w', encoding='utf-8-sig') as f:
                         for n, c in items:
@@ -603,12 +922,12 @@ def main():
                 except Exception as e:
                     logger.error(f"导出剩余院校名单失败: {e}")
 
-                # 优先在数据库端完成按时间聚合，显著减少数据量与Python端开销
+                # 优先在数据库端完成按时间聚合
                 pairs = [(s['ipgroup_id'], s['nfa_uuid']) for s in remaining_schools]
-                df_agg = aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time)
+                df_agg = aggregate_speed_data_for_pairs_db(data_conn, pairs, args.start_time, args.end_time)
                 if df_agg.empty:
                     # 回退到Python端聚合
-                    df_agg = aggregate_speed_data_for_schools(connection, remaining_schools, start_time, end_time)
+                    df_agg = aggregate_speed_data_for_schools(data_conn, remaining_schools, args.start_time, args.end_time)
 
                 if df_agg.empty:
                     logger.warning("剩余院校在时间范围内没有数据，跳过剩余组计算。")
@@ -628,7 +947,7 @@ def main():
                                 'direction': args.direction,
                                 'data_points_daily': len(group)
                             })
-                        save_results(results_remaining, out_remaining, True, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
+                        save_results(results_remaining, out_remaining, True, args.direction, args.start_time, args.end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
                     else:
                         val = calculate_95th_percentile(df_agg.to_dict('records'), args.direction)
                         results_remaining = [{
@@ -640,35 +959,52 @@ def main():
                             'data_points': len(df_agg),
                             'direction': args.direction
                         }]
-                        save_results(results_remaining, out_remaining, False, args.direction, start_time, end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
+                        save_results(results_remaining, out_remaining, False, args.direction, args.start_time, args.end_time, extra_log_prefix="[剩余组-汇总] ", sort_by=args.sortby, sort_order=args.sort_order)
             else:
                 logger.warning("排除后无剩余院校可计算，跳过剩余组计算。")
         else:
-            # 新增：支持整体汇总与批量逐校两种快速路径
-            if args.aggregate_all:
+            # 支持整体汇总与批量逐校两种快速路径
+            if args.group_by_school:
+                if args.export_daily:
+                    logger.info("启用 --group-by-school 快速批量模式：按 (region, cp, school_name) 聚合后按天输出95值")
+                    results = compute_grouped_results_batched(
+                        data_conn, schools, args.start_time, args.end_time, args.direction,
+                        export_daily=True, batch_size=args.batch_size
+                    )
+                else:
+                    logger.info("启用 --group-by-school 快速批量模式：按 (region, cp, school_name) 聚合后输出周期95值")
+                    results = compute_grouped_results_batched(
+                        data_conn, schools, args.start_time, args.end_time, args.direction,
+                        export_daily=False, batch_size=args.batch_size
+                    )
+            elif args.aggregate_all:
                 logger.info("启用 --aggregate-all：将所有符合条件的院校在相同时间点上汇总后计算95值")
-                results = aggregate_all_and_compute(connection, schools, start_time, end_time, args.direction, args.export_daily)
+                results = aggregate_all_and_compute(data_conn, schools, args.start_time, args.end_time, args.direction, args.export_daily)
             else:
                 logger.info("启用批量拉取快速模式：逐校（或逐校按天）在内存中计算95值，减少数据库往返")
-                results = process_schools_batched(connection, schools, start_time, end_time, args.direction, args.export_daily, batch_size=args.batch_size)
+                results = process_schools_batched(data_conn, schools, args.start_time, args.end_time, args.direction, args.export_daily, batch_size=args.batch_size)
 
             if args.export_daily:
-                save_results(results, args.output, True, args.direction, start_time, end_time, sort_by=args.sortby, sort_order=args.sort_order)
+                save_results(results, args.output, True, args.direction, args.start_time, args.end_time, sort_by=args.sortby, sort_order=args.sort_order)
             else:
-                save_results(results, args.output, False, args.direction, start_time, end_time, sort_by=args.sortby, sort_order=args.sort_order)
+                save_results(results, args.output, False, args.direction, args.start_time, args.end_time, sort_by=args.sortby, sort_order=args.sort_order)
                 logger.info("汇总信息:")
                 logger.info(f"  省份: {args.province}")
                 logger.info(f"  CP类型: {args.cp}")
                 if args.school:
                     logger.info(f"  指定院校: {args.school}")
-                logger.info(f"  时间范围: {start_time} - {end_time}")
+                logger.info(f"  时间范围: {args.start_time} - {args.end_time}")
                 logger.info(f"  流量方向: {args.direction}")
-    
+
     except Exception as e:
         logger.error(f"处理过程中发生错误: {e}")
     finally:
-        if connection:
-            connection.close()
+        try:
+            if rel_conn:
+                rel_conn.close()
+        finally:
+            if data_conn:
+                data_conn.close()
 
 if __name__ == "__main__":
     main()

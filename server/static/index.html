@@ -105,6 +105,7 @@
           <option value="school_id">合并键：按学校ID</option>
           <option value="school_name">合并键：按学校名称</option>
         </select>
+        <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合</label>
         <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="newTask.params.school" placeholder="指定院校(逗号分隔)" />
@@ -238,6 +239,7 @@
           <option value="school_id">合并键：按学校ID</option>
           <option value="school_name">合并键：按学校名称</option>
         </select>
+        <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合</label>
         <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
         <input v-model="editTask.params.school" placeholder="指定院校(逗号分隔)" />
