@@ -183,17 +183,50 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
             # 忽略 export_daily，改为输出按自然月聚合的行
             base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
             rows_all: list[dict] = []
+
             for rg in _month_ranges(start_time, end_time):
-                month_rows = c95.process_schools_batched(
-                    conn, schools,
-                    pd.to_datetime(rg['start']), pd.to_datetime(rg['end']),
-                    direction, False,
-                    batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
-                )
+                st = pd.to_datetime(rg['start'])
+                et = pd.to_datetime(rg['end'])
+
+                if aggregate_all:
+                    if settlement_mode == 'daily_95_avg':
+                        # 先算该月“每日95”，再按该月天数求平均
+                        rows_daily = c95.aggregate_all_and_compute(conn, schools, st, et, direction, True, unit_base=unit_base)
+                        df_daily = _to_dataframe(rows_daily)
+                        try:
+                            _days = max(1, int(df_daily.shape[0]))
+                        except Exception:
+                            _days = 1
+                        if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
+                            avg_val = float(df_daily['daily_95th_percentile_mbps'].sum()) / float(_days)
+                        else:
+                            avg_val = 0.0
+                        month_rows = [{
+                            'school_id': '',
+                            'ipgroup_name': '全部院校汇总',
+                            'ipgroup_id': '',
+                            'nfa_uuid': '',
+                            'saler_group': '',
+                            'saler': '',
+                            '95th_percentile_mbps': avg_val,
+                            'direction': direction,
+                        }]
+                    else:
+                        # 该月范围内在时间点上汇总后计算 95
+                        month_rows = c95.aggregate_all_and_compute(conn, schools, st, et, direction, False, unit_base=unit_base)
+                else:
+                    month_rows = c95.process_schools_batched(
+                        conn, schools,
+                        st, et,
+                        direction, False,
+                        batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                    )
+
                 if month_rows:
                     for it in month_rows:
                         it['month'] = rg['label']
                     rows_all.extend(month_rows)
+
             dfm = _to_dataframe(rows_all)
             if not dfm.empty:
                 sort_keys = []

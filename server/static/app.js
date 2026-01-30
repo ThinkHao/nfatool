@@ -145,7 +145,10 @@ createApp({
       // 先规范化自定义时间窗口
       this.normalizeCustomWindow(this.newTask)
       if (!this.validateTask(this.newTask)) return
-      const res = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(this.newTask) }, this.apiKey)
+      const payload = JSON.parse(JSON.stringify(this.newTask))
+      this.normalizeCustomWindow(payload)
+      this._deepTrimValue(payload)
+      const res = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) { alert('创建失败'); return }
       await this.loadTasks()
     },
@@ -180,10 +183,29 @@ createApp({
       const allowKeys = ['name','active','kind','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
       const body = {}
       for (const k of allowKeys) { if (k in this.editTask) body[k] = this.editTask[k] }
+      this.normalizeCustomWindow(body)
+      this._deepTrimValue(body)
       const res = await apiFetch('/api/tasks/' + this.editTask.id, { method: 'PUT', body: JSON.stringify(body) }, this.apiKey)
       if (!res.ok) { const txt = await res.text(); alert('保存失败: ' + txt); return }
       this.editTask = null
       await this.loadTasks()
+    },
+    _deepTrimValue(v) {
+      if (v == null) return v
+      if (typeof v === 'string') return v.trim()
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) {
+          v[i] = this._deepTrimValue(v[i])
+        }
+        return v
+      }
+      if (typeof v === 'object') {
+        for (const k of Object.keys(v)) {
+          v[k] = this._deepTrimValue(v[k])
+        }
+        return v
+      }
+      return v
     },
     async removeTask(id) {
       if (!confirm('确认删除?')) return

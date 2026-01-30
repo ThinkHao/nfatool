@@ -23,12 +23,12 @@
     <section>
       <h2>任务管理</h2>
       <div class="row">
-        <input v-model="apiKey" placeholder="X-API-KEY" />
+        <input v-model.trim="apiKey" placeholder="X-API-KEY" />
         <button @click="loadTasks">刷新任务列表</button>
       </div>
 
       <div class="row">
-        <input v-model="tasksQuery.q" placeholder="搜索任务名" />
+        <input v-model.trim="tasksQuery.q" placeholder="搜索任务名" />
         <select v-model="tasksQuery.sort_by">
           <option value="id">按ID</option>
           <option value="name">按名称</option>
@@ -43,7 +43,7 @@
       </div>
 
       <div class="row">
-        <input v-model="newTask.name" placeholder="任务名" />
+        <input v-model.trim="newTask.name" placeholder="任务名" />
         <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
         <label>
           任务类型：
@@ -63,10 +63,10 @@
             <option value="weekly_preset">weekly_preset(每周一)</option>
           </select>
         </label>
-        <input v-if="newTask.schedule_type==='cron'" v-model="newTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
+        <input v-if="newTask.schedule_type==='cron'" v-model.trim="newTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
         <input v-if="newTask.schedule_type==='interval'" v-model.number="newTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
-        <input v-if="newTask.schedule_type==='weekly_preset'" v-model="newTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
-        <input v-model="newTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
+        <input v-if="newTask.schedule_type==='weekly_preset'" v-model.trim="newTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
+        <input v-model.trim="newTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
       </div>
       <div class="row">
         <span style="margin-right:6px;">时间范围：</span>
@@ -80,8 +80,8 @@
       </div>
       <div class="row">
         <span style="margin-right:6px;">匹配条件：</span>
-        <input v-model="newTask.params.province" placeholder="省份，如四川省" />
-        <input v-model="newTask.params.cp" placeholder="CP，如bilibili" />
+        <input v-model.trim="newTask.params.province" placeholder="省份，如四川省" />
+        <input v-model.trim="newTask.params.cp" placeholder="CP，如bilibili" />
         <select v-model="newTask.params.direction">
           <option value="both">both</option>
           <option value="recv">recv</option>
@@ -108,9 +108,9 @@
         <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合</label>
         <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
-        <input v-model="newTask.params.school" placeholder="指定院校(逗号分隔)" />
-        <input v-model="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
-        <input v-model="newTask.params.sortby" placeholder="排序字段" />
+        <input v-model.trim="newTask.params.school" placeholder="指定院校(逗号分隔)" />
+        <input v-model.trim="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+        <input v-model.trim="newTask.params.sortby" placeholder="排序字段" />
         <select v-model="newTask.params.sort_order">
           <option value="desc">desc</option>
           <option value="asc">asc</option>
@@ -119,7 +119,7 @@
       <div class="row">
         <label><input type="checkbox" value="csv" v-model="newTask.export_formats" /> CSV</label>
         <label><input type="checkbox" value="xlsx" v-model="newTask.export_formats" /> XLSX</label>
-        <input v-model="newTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
+        <input v-model.trim="newTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
         <button @click="createTask">创建任务</button>
       </div>
       <div class="row" style="margin-top:-8px; color:#666; font-size: 12px;">
@@ -177,7 +177,7 @@
     <section v-if="editTask">
       <h2>编辑任务</h2>
       <div class="row">
-        <input v-model="editTask.name" placeholder="任务名" />
+        <input v-model.trim="editTask.name" placeholder="任务名" />
         <label><input type="checkbox" v-model="editTask.active" /> 启用</label>
         <label>
           任务类型：
@@ -197,10 +197,10 @@
             <option value="weekly_preset">weekly_preset(每周一)</option>
           </select>
         </label>
-        <input v-if="editTask.schedule_type==='cron'" v-model="editTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
+        <input v-if="editTask.schedule_type==='cron'" v-model.trim="editTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
         <input v-if="editTask.schedule_type==='interval'" v-model.number="editTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
-        <input v-if="editTask.schedule_type==='weekly_preset'" v-model="editTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
-        <input v-model="editTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
+        <input v-if="editTask.schedule_type==='weekly_preset'" v-model.trim="editTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
+        <input v-model.trim="editTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
       </div>
       <div class="row">
         <span style="margin-right:6px;">时间范围：</span>
@@ -214,8 +214,8 @@
       </div>
       <div class="row">
         <span style="margin-right:6px;">匹配条件：</span>
-        <input v-model="editTask.params.province" placeholder="省份，如四川省" />
-        <input v-model="editTask.params.cp" placeholder="CP，如bilibili" />
+        <input v-model.trim="editTask.params.province" placeholder="省份，如四川省" />
+        <input v-model.trim="editTask.params.cp" placeholder="CP，如bilibili" />
         <select v-model="editTask.params.direction">
           <option value="both">both</option>
           <option value="recv">recv</option>
@@ -242,9 +242,9 @@
         <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合</label>
         <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
         <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
-        <input v-model="editTask.params.school" placeholder="指定院校(逗号分隔)" />
-        <input v-model="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
-        <input v-model="editTask.params.sortby" placeholder="排序字段" />
+        <input v-model.trim="editTask.params.school" placeholder="指定院校(逗号分隔)" />
+        <input v-model.trim="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+        <input v-model.trim="editTask.params.sortby" placeholder="排序字段" />
         <select v-model="editTask.params.sort_order">
           <option value="desc">desc</option>
           <option value="asc">asc</option>
@@ -253,7 +253,7 @@
       <div class="row">
         <label><input type="checkbox" value="csv" v-model="editTask.export_formats" /> CSV</label>
         <label><input type="checkbox" value="xlsx" v-model="editTask.export_formats" /> XLSX</label>
-        <input v-model="editTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
+        <input v-model.trim="editTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
         <button @click="saveEdit">保存</button>
         <button @click="cancelEdit">取消</button>
       </div>
