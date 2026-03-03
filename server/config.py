@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     CONFIG_ENCRYPTION_KEY: Optional[str] = None
     CONFIG_AUTO_ROTATE_ENABLED: bool = True
     CONFIG_AUTO_ROTATE_DAYS: int = 30
+    APP_VERSION: str = "0.1.0"
+    GITHUB_REPO: Optional[str] = None  # owner/repo
+    UPDATE_ASSET_LINUX: str = "nfa95"
+    UPDATE_ASSET_WINDOWS: str = "nfa95.exe"
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", case_sensitive=False)
 

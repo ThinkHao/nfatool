@@ -137,3 +137,7 @@ class DataSourceRotateKeyPayload(BaseModel):
 class DataSourceRotatePolicyPayload(BaseModel):
     enabled: bool = True
     interval_days: int = 30
+
+
+class UpdateApplyPayload(BaseModel):
+    restart_after_update: bool = True

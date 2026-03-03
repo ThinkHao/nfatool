@@ -12,6 +12,9 @@ createApp({
     return {
       apiKey: '',
       health: '-',
+      updateInfo: null,
+      updateChecking: false,
+      updateApplying: false,
       tasks: [],
       runs: [],
       tasksPage: { items: [], total: 0, page: 1, page_size: 20 },
@@ -165,6 +168,40 @@ createApp({
       const res = await fetch('/api/health')
       const data = await res.json()
       this.health = data.status
+    },
+    async checkUpdate() {
+      this.updateChecking = true
+      try {
+        const res = await apiFetch('/api/meta/update', {}, this.apiKey)
+        if (!res.ok) {
+          const txt = await res.text()
+          this.updateInfo = { ok: false, message: txt }
+          return
+        }
+        this.updateInfo = await res.json()
+      } catch (e) {
+        this.updateInfo = { ok: false, message: String(e) }
+      } finally {
+        this.updateChecking = false
+      }
+    },
+    async applyUpdate() {
+      if (!this.updateInfo || !this.updateInfo.update_available) { alert('当前已是最新版本'); return }
+      if (!confirm(`确认升级到 ${this.updateInfo.latest_version}？升级后将自动重启当前进程。`)) return
+      this.updateApplying = true
+      try {
+        const payload = { restart_after_update: true }
+        const res = await apiFetch('/api/meta/update/apply', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
+        if (!res.ok) {
+          const txt = await res.text()
+          alert('升级失败: ' + txt)
+          return
+        }
+        const data = await res.json()
+        alert(`升级已执行：${data.message || 'ok'}。服务正在重启，请稍后刷新页面。`)
+      } finally {
+        this.updateApplying = false
+      }
     },
     async loadDataSources() {
       try {
@@ -1162,6 +1199,7 @@ createApp({
   },
   mounted() {
     this.checkHealth()
+    this.checkUpdate()
     this.loadDataSources()
     this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
     this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)

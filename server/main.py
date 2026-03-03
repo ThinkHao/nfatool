@@ -35,7 +35,7 @@ from .models import Task, JobRun
 from .schemas import (
     TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut,
     TaskBatchDelete, JobBatchDelete, JobBatchDownload,
-    DataSourceInstancePayload, DataSourceTestPayload, DataSourceRotateKeyPayload, DataSourceRotatePolicyPayload,
+    DataSourceInstancePayload, DataSourceTestPayload, DataSourceRotateKeyPayload, DataSourceRotatePolicyPayload, UpdateApplyPayload,
 )
 from .security import api_key_auth
 from .services.scheduler import (
@@ -50,6 +50,7 @@ from .services import scheduler as scheduler_service
 from .services.storage import get_job_dir
 from .services.logger import get_job_log_path
 from .services.compute95 import _connect_edc_db
+from .services.updater import check_update, apply_update
 
 app = FastAPI(title="NFA 95th Web Service", version="0.1.0")
 
@@ -258,6 +259,22 @@ async def rotate_key_auto_api(force: bool = Query(default=True)):
     try:
         result = auto_rotate_data_source_key(force=bool(force))
         return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/meta/update", dependencies=[Depends(api_key_auth)])
+async def get_update_info_api():
+    try:
+        return check_update()
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+@app.post("/api/meta/update/apply", dependencies=[Depends(api_key_auth)])
+async def apply_update_api(payload: UpdateApplyPayload):
+    try:
+        return apply_update(restart_after_update=bool(payload.restart_after_update))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
