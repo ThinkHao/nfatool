@@ -344,15 +344,17 @@ def _upsert_runtime_instance(source_type: str, instance: str, config: dict[str, 
         _ensure_data_source_table(conn)
         enc = _encrypt_config(config)
         now = "CURRENT_TIMESTAMP"
-        conn.execute(
-            f"""
-            INSERT INTO data_source_configs (source_type, instance, config_enc, created_at, updated_at)
-            VALUES (?, ?, ?, {now}, {now})
-            ON CONFLICT(source_type, instance)
-            DO UPDATE SET config_enc=excluded.config_enc, updated_at={now}
-            """,
-            (source_type, instance, enc),
+        # Compatible with older SQLite versions (no UPSERT syntax support):
+        # update first, then insert if no row was affected.
+        cur = conn.execute(
+            "UPDATE data_source_configs SET config_enc=?, updated_at=CURRENT_TIMESTAMP WHERE source_type=? AND instance=?",
+            (enc, source_type, instance),
         )
+        if int(cur.rowcount or 0) <= 0:
+            conn.execute(
+                "INSERT INTO data_source_configs (source_type, instance, config_enc, created_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                (source_type, instance, enc),
+            )
         _record_config_audit(
             conn,
             action="upsert",
