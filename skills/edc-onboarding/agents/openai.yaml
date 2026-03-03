@@ -1,0 +1,3 @@
+interface:
+  display_name: "EDC Onboarding"
+  short_description: "Onboard EDC instances and debug SSH/DB connectivity"

@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>NFA 95th 服务</title>
+  <title>NFA/EDC 95th 服务</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
@@ -12,173 +12,334 @@
 </head>
 <body>
   <div id="app">
-    <h1>NFA 95th 服务</h1>
+    <header class="hero">
+      <div>
+        <h1>NFA/EDC 95th 任务工作台</h1>
+        <p>统一配置一次性与周期性任务，到点自动计算并下载产物。</p>
+      </div>
+      <div class="hero-actions">
+        <input v-model.trim="apiKey" placeholder="X-API-KEY" />
+        <button @click="checkHealth">健康检查</button>
+        <span class="status-dot">{{ health }}</span>
+      </div>
+    </header>
 
-    <section>
-      <h2>健康检查</h2>
-      <button @click="checkHealth">检查</button>
-      <span>{{ health }}</span>
+    <section class="tool-switches">
+      <div class="row">
+        <button class="btn-muted" @click="ui.showSourceAdmin = !ui.showSourceAdmin">{{ ui.showSourceAdmin ? '收起数据源配置' : '展开数据源配置' }}</button>
+        <button class="btn-muted" @click="ui.showBulkImport = !ui.showBulkImport">{{ ui.showBulkImport ? '收起EDC批量导入' : '展开EDC批量导入' }}</button>
+      </div>
     </section>
 
-    <section>
-      <h2>任务管理</h2>
-      <div class="row">
-        <input v-model.trim="apiKey" placeholder="X-API-KEY" />
-        <button @click="loadTasks">刷新任务列表</button>
-      </div>
-
-      <div class="row">
-        <input v-model.trim="tasksQuery.q" placeholder="搜索任务名" />
-        <select v-model="tasksQuery.sort_by">
-          <option value="id">按ID</option>
-          <option value="name">按名称</option>
-          <option value="created_at">按创建时间</option>
-          <option value="updated_at">按更新时间</option>
-        </select>
-        <select v-model="tasksQuery.sort_order">
-          <option value="desc">降序</option>
-          <option value="asc">升序</option>
-        </select>
-        <button @click="applyTasksQuery">应用</button>
-      </div>
-
-      <div class="row">
-        <input v-model.trim="newTask.name" placeholder="任务名" />
-        <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
-        <label>
-          任务类型：
-          <select v-model="newTask.kind">
-            <option value="one_off">一次性</option>
-            <option value="periodic">周期性</option>
-          </select>
-        </label>
-      </div>
-      <div class="row" v-if="newTask.kind==='periodic'">
-        <label>
-          调度类型：
-          <select v-model="newTask.schedule_type">
-            <option :value="null">选择类型</option>
-            <option value="cron">cron</option>
-            <option value="interval">interval(秒)</option>
-            <option value="weekly_preset">weekly_preset(每周一)</option>
-          </select>
-        </label>
-        <input v-if="newTask.schedule_type==='cron'" v-model.trim="newTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
-        <input v-if="newTask.schedule_type==='interval'" v-model.number="newTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
-        <input v-if="newTask.schedule_type==='weekly_preset'" v-model.trim="newTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
-        <input v-model.trim="newTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
-      </div>
-      <div class="row">
-        <span style="margin-right:6px;">时间范围：</span>
-        <select v-model="newTask.window_selector">
-          <option value="custom">自定义</option>
-          <option value="last_week">上一周</option>
-          <option value="last_n_days">最后N天</option>
-        </select>
-        <input v-if="newTask.window_selector==='last_n_days'" v-model.number="newTask.window_params.n" type="number" min="1" placeholder="N(天)" />
-        <input v-if="newTask.window_selector==='custom'" id="range-new" placeholder="选择日期范围" />
-      </div>
-      <div class="row">
-        <span style="margin-right:6px;">匹配条件：</span>
-        <input v-model.trim="newTask.params.province" placeholder="省份，如四川省" />
-        <input v-model.trim="newTask.params.cp" placeholder="CP，如bilibili" />
-        <select v-model="newTask.params.direction">
-          <option value="both">both</option>
-          <option value="recv">recv</option>
-          <option value="send">send</option>
-        </select>
-        <select v-model.number="newTask.params.unit_base">
-          <option :value="1024">单位换算 1024</option>
-          <option :value="1000">单位换算 1000</option>
-        </select>
-        <select v-model="newTask.params.settlement_mode">
-          <option value="range_95">结算方式：月95</option>
-          <option value="daily_95_avg">结算方式：日95平均</option>
-        </select>
-        <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
-        <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" /> V4/V6累加</label>
-        <select v-model="newTask.params.merge_key">
-          <option value="">合并键：不合并</option>
-          <option value="ipgroup_name_base">合并键：按名称去后缀(_V4/_V6)</option>
-          <option value="ipgroup_name">合并键：按IP组名称</option>
-          <option value="school_name_plus_cp">合并键：学校名称+CP</option>
-          <option value="school_id">合并键：按学校ID</option>
-          <option value="school_name">合并键：按学校名称</option>
-        </select>
-        <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合</label>
-        <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
-        <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
-        <input v-model.trim="newTask.params.school" placeholder="指定院校(逗号分隔)" />
-        <input v-model.trim="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
-        <input v-model.trim="newTask.params.sortby" placeholder="排序字段" />
-        <select v-model="newTask.params.sort_order">
-          <option value="desc">desc</option>
-          <option value="asc">asc</option>
-        </select>
-      </div>
-      <div class="row">
-        <label><input type="checkbox" value="csv" v-model="newTask.export_formats" /> CSV</label>
-        <label><input type="checkbox" value="xlsx" v-model="newTask.export_formats" /> XLSX</label>
-        <input v-model.trim="newTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
-        <button @click="createTask">创建任务</button>
-      </div>
-      <div class="row" style="margin-top:-8px; color:#666; font-size: 12px;">
-        可用占位符：{province}、{cp}、{direction}、{window}、{date}。示例：{province}-{cp}-{direction}-{window}.csv
-      </div>
-      <div class="row" style="margin-top:-8px; color:#333; font-size: 12px;">
-        文件名预览：{{ filenamePreview(newTask) }}
-      </div>
-
-      <table class="table">
-        <thead>
-          <tr>
-            <th>ID</th><th>名称</th><th>启用</th><th>窗口</th><th>任务类型</th><th>调度</th><th>下次运行</th><th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="t in tasks" :key="t.id">
-            <td>{{ t.id }}</td>
-            <td>{{ t.name }}</td>
-            <td>{{ t.active ? '是' : '否' }}</td>
-            <td>{{ t.window_selector }}</td>
-            <td>{{ t.kind === 'periodic' ? '周期性' : '一次性' }}</td>
-            <td>{{ scheduleSummary(t) }}</td>
-            <td>{{ formatDateTime(t.next_run_time) }}</td>
-            <td>
-              <button @click="toggleActive(t)">{{ t.active ? '暂停' : '启用' }}</button>
-              <button @click="startEdit(t)">编辑</button>
-              <button @click="runTask(t.id)">立即运行</button>
-              <button @click="viewRuns(t.id)">查看运行</button>
-              <button @click="removeTask(t.id)">删除</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div class="row">
-        <div>
-          <label>每页：
-            <select v-model.number="tasksPage.page_size" @change="changeTasksPageSize">
-              <option :value="10">10</option>
-              <option :value="20">20</option>
-              <option :value="50">50</option>
-              <option :value="100">100</option>
+    <section class="source-admin" v-if="ui.showSourceAdmin">
+      <div class="panel-head">
+        <h2>数据源配置管理</h2>
+        <div class="row">
+          <label>类型
+            <select v-model="sourceAdmin.source_type">
+              <option value="all">全部</option>
+              <option value="edc">EDC</option>
+              <option value="nfa">NFA</option>
             </select>
           </label>
-          <button @click="prevTasksPage">上一页</button>
-          <button @click="nextTasksPage">下一页</button>
-          <span style="margin-left:8px;">第 {{ tasksPage.page }} / {{ totalPages(tasksPage.total, tasksPage.page_size) }} 页（共 {{ tasksPage.total }} 条）</span>
-          <span style="margin-left:12px;">跳转到页：</span>
-          <input v-model.number="tasksPageJump" type="number" min="1" style="width:80px" />
-          <button @click="jumpTasksPage">跳转</button>
+          <button class="btn-muted" @click="loadSourceAdminInstances">刷新</button>
+          <input v-model.trim="sourceAdmin.new_instance" placeholder="新实例名" />
+          <button @click="createSourceAdminInstance">新建实例</button>
+        </div>
+      </div>
+      <div class="source-admin-grid">
+        <div class="source-admin-list">
+          <div
+            v-for="it in sourceAdmin.items"
+            :key="'src-' + it.source_type + '-' + it.instance"
+            class="source-item"
+            :class="{active: sourceAdmin.selected_instance===it.instance}"
+            @click="selectSourceAdminInstance(it)"
+          >
+            <div>{{ it.instance }}</div>
+            <div class="hint">来源：{{ it.origin }}</div>
+          </div>
+        </div>
+        <div>
+          <div class="row">
+            <span class="hint">当前实例：{{ sourceAdmin.selected_instance || '-' }} ({{ sourceAdmin.selected_source_type || sourceAdmin.source_type || '-' }})</span>
+            <button @click="saveSourceAdminInstance">保存配置</button>
+            <button class="btn-danger" @click="deleteSourceAdminInstance">删除实例</button>
+            <button class="btn-muted" @click="testSourceAdminConnection">测试连接</button>
+          </div>
+          <textarea v-model="sourceAdmin.editor_text" class="json-editor" placeholder="实例配置(JSON)"></textarea>
+          <div class="meta-text">提示：`ssh_pkey` 需要填写私钥文件路径，不是 `ssh-rsa ...` 公钥文本。</div>
+          <div class="meta-text" v-if="sourceAdmin.test_result">
+            连通性：{{ sourceAdmin.test_result.ok ? '成功' : '失败' }} | 耗时 {{ sourceAdmin.test_result.elapsed_ms || 0 }}ms | {{ sourceAdmin.test_result.message || '-' }}
+          </div>
+          <div class="row">
+            <span class="hint">自动轮换：</span>
+            <label><input type="checkbox" v-model="sourceAdmin.rotate_policy.enabled" /> 启用</label>
+            <input v-model.number="sourceAdmin.rotate_policy.interval_days" type="number" min="1" placeholder="周期(天)" style="width:110px;" />
+            <button class="btn-muted" @click="saveRotatePolicy">保存策略</button>
+            <button class="btn-danger" @click="rotateSourceAdminKeyAutoNow">立即轮换</button>
+            <span class="hint">上次：{{ formatDateTimeShort(sourceAdmin.rotate_policy.last_rotated_at) }}</span>
+          </div>
+          <details class="budget-detail">
+            <summary>高级：手动指定旧/新密钥轮换</summary>
+            <div class="row">
+              <input v-model.trim="sourceAdmin.rotate_old_seed" type="password" placeholder="旧密钥(old_seed)" />
+              <input v-model.trim="sourceAdmin.rotate_new_seed" type="password" placeholder="新密钥(new_seed)" />
+              <button class="btn-danger" @click="rotateSourceAdminKey">执行手动轮换</button>
+            </div>
+          </details>
+          <div class="row">
+            <span class="hint">配置审计：</span>
+            <label>最近
+              <select v-model.number="sourceAdmin.audit_limit">
+                <option :value="20">20</option>
+                <option :value="50">50</option>
+                <option :value="100">100</option>
+              </select>
+            </label>
+            <button class="btn-muted" @click="loadSourceAdminAudit">刷新审计</button>
+          </div>
+          <div class="audit-list">
+            <div class="audit-row" v-for="it in sourceAdmin.audit_items" :key="'audit-' + it.id">
+              <span class="audit-time">{{ formatDateTimeShort(it.created_at) }}</span>
+              <span class="audit-main">{{ it.action }} {{ (it.source_type || '').toUpperCase() }}/{{ it.instance }}</span>
+              <span class="audit-actor">{{ it.actor || '-' }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </section>
 
-    <section v-if="editTask">
-      <h2>编辑任务</h2>
+    <section class="import-panel" v-if="ui.showBulkImport">
+      <h2>EDC 批量导入</h2>
+      <div class="row">
+        <textarea v-model="bulkImportText" placeholder="粘贴 day-95.sh / day-95-ali.sh 命令，一行一个" style="width:100%; min-height:96px;"></textarea>
+      </div>
+      <div class="row">
+        <button @click="parseBulkImportCommands">解析命令</button>
+        <button class="btn-muted" @click="precheckBulkImport" :disabled="!bulkImportItems.length">预检去重</button>
+        <button class="btn-muted" @click="clearBulkImport">清空</button>
+        <span class="hint">已识别 {{ bulkImportItems.length }} 条</span>
+        <span class="hint" v-if="bulkPrecheckSummary.total">
+          预检：冲突 {{ bulkPrecheckSummary.conflict_items }}/{{ bulkPrecheckSummary.total }}
+          （名称 {{ bulkPrecheckSummary.name_conflict + bulkPrecheckSummary.batch_name_conflict }}，
+          EDC+实例 {{ bulkPrecheckSummary.key_conflict + bulkPrecheckSummary.batch_key_conflict }}）
+        </span>
+      </div>
+      <div class="row">
+        <span class="hint">批量参数：</span>
+        <label>实例
+          <select v-model="bulkDefaults.data_source_instance">
+            <option v-for="inst in getSourceInstances('edc')" :key="'bulk-edc-' + inst" :value="inst">{{ inst }}</option>
+          </select>
+        </label>
+        <label>任务类型
+          <select v-model="bulkDefaults.kind">
+            <option value="periodic">周期性</option>
+            <option value="one_off">一次性</option>
+          </select>
+        </label>
+        <label><input type="checkbox" v-model="bulkDefaults.active" /> 启用</label>
+        <template v-if="bulkDefaults.kind==='periodic'">
+          <label>调度
+            <select v-model="bulkDefaults.schedule_type">
+              <option value="cron">cron</option>
+              <option value="interval">interval(秒)</option>
+            </select>
+          </label>
+          <input v-model.trim="bulkDefaults.schedule_expr" placeholder="cron/秒，例如 0 1 1 * *" />
+        </template>
+        <label>窗口
+          <select v-model="bulkDefaults.window_selector">
+            <option value="last_month">上一月</option>
+            <option value="last_week">上一周</option>
+            <option value="last_n_days">最后N天</option>
+          </select>
+        </label>
+        <input v-if="bulkDefaults.window_selector==='last_n_days'" v-model.number="bulkDefaults.window_n_days" type="number" min="1" placeholder="N(天)" />
+        <label>结算
+          <select v-model="bulkDefaults.settlement_mode">
+            <option value="daily_95_avg">日95月平均</option>
+            <option value="range_95">月95</option>
+          </select>
+        </label>
+        <label>换算基数
+          <select v-model.number="bulkDefaults.unit_base">
+            <option :value="1024">1024</option>
+            <option :value="1000">1000</option>
+          </select>
+        </label>
+        <label><input type="checkbox" v-model="bulkDefaults.data_budget_enabled" /> 数据预算</label>
+        <input v-if="bulkDefaults.data_budget_enabled" v-model.number="bulkDefaults.data_budget_mul" type="number" step="0.0001" placeholder="乘数" />
+        <input v-if="bulkDefaults.data_budget_enabled" v-model.number="bulkDefaults.data_budget_div" type="number" step="0.0001" placeholder="除数" />
+        <label><input type="checkbox" value="csv" v-model="bulkDefaults.export_formats" /> CSV</label>
+        <label><input type="checkbox" value="xlsx" v-model="bulkDefaults.export_formats" /> XLSX</label>
+        <input v-model.trim="bulkDefaults.output_filename_template" placeholder="命名模板（可空）" />
+      </div>
+      <div class="list-wrap" style="max-height:220px;">
+        <div class="item-card" :class="{ 'conflict-card': (it.conflicts || []).length > 0 }" v-for="it in bulkImportItems" :key="it.id">
+          <label class="pick"><input type="checkbox" v-model="it.selected" /></label>
+          <div class="item-main">
+            <div class="row">
+              <input v-model.trim="it.name" placeholder="任务名" style="min-width:220px;" />
+              <input v-model.trim="it.edc_name" placeholder="EDC名称" style="min-width:240px;" />
+              <input v-if="bulkDefaults.kind==='periodic'" v-model.trim="it.schedule_expr" placeholder="单独调度(可空，覆盖批量)" style="min-width:220px;" />
+            </div>
+            <div class="row conflict-row" v-if="(it.conflicts || []).length">
+              <span class="conflict-tag" v-for="(c, idx) in it.conflicts" :key="it.id + '-c-' + idx">{{ c }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="row">
+        <button @click="importSelectedBulkTasks">导入选中任务</button>
+      </div>
+    </section>
+
+    <section class="wizard">
+      <div class="step">
+        <h3>Step 1. 基础信息</h3>
+        <div class="row">
+          <input v-model.trim="newTask.name" placeholder="任务名" />
+          <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
+          <label>
+            数据源：
+            <select v-model="newTask.data_source_type">
+              <option value="nfa">NFA</option>
+              <option value="edc">EDC</option>
+            </select>
+          </label>
+          <label>
+            实例：
+            <select v-model="newTask.data_source_instance">
+              <option v-for="inst in getSourceInstances(newTask.data_source_type)" :key="'new-inst-' + inst" :value="inst">{{ inst }}</option>
+            </select>
+          </label>
+          <label>
+            任务类型：
+            <select v-model="newTask.kind">
+              <option value="one_off">一次性</option>
+              <option value="periodic">周期性</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div class="step">
+        <h3>Step 2. 时间与调度</h3>
+        <div class="row">
+          <span>时间范围：</span>
+          <select v-model="newTask.window_selector">
+            <option value="custom">自定义</option>
+            <option value="last_week">上一周</option>
+            <option value="last_month">上一月</option>
+            <option value="last_n_days">最后N天</option>
+          </select>
+          <input v-if="newTask.window_selector==='last_n_days'" v-model.number="newTask.window_params.n" type="number" min="1" placeholder="N(天)" />
+          <input v-if="newTask.window_selector==='custom'" id="range-new" placeholder="选择日期范围" />
+        </div>
+        <div class="row" v-if="newTask.kind==='periodic'">
+          <label>
+            调度类型：
+            <select v-model="newTask.schedule_type">
+              <option :value="null">选择类型</option>
+              <option value="cron">cron</option>
+              <option value="interval">interval(秒)</option>
+              <option value="weekly_preset">weekly_preset(每周一)</option>
+            </select>
+          </label>
+          <input v-if="newTask.schedule_type==='cron'" v-model.trim="newTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
+          <input v-if="newTask.schedule_type==='interval'" v-model.number="newTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
+          <input v-if="newTask.schedule_type==='weekly_preset'" v-model.trim="newTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
+          <input v-model.trim="newTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
+        </div>
+      </div>
+
+      <div class="step">
+        <h3>Step 3. 统计参数</h3>
+        <div class="row">
+          <template v-if="newTask.data_source_type==='nfa'">
+            <input v-model.trim="newTask.params.province" placeholder="省份，如四川省" />
+            <input v-model.trim="newTask.params.cp" placeholder="CP，如bilibili" />
+          </template>
+          <template v-else>
+            <input v-model.trim="newTask.params.edc_name" placeholder="EDC名称，如 BJ-jinshan-*" />
+            <label><input type="checkbox" v-model="newTask.params.data_budget_enabled" /> 数据预算</label>
+            <input v-if="newTask.params.data_budget_enabled" v-model.number="newTask.params.data_budget_mul" type="number" step="0.0001" placeholder="乘数，如 8" />
+            <input v-if="newTask.params.data_budget_enabled" v-model.number="newTask.params.data_budget_div" type="number" step="0.0001" placeholder="除数，如 300" />
+          </template>
+
+          <select v-if="newTask.data_source_type==='nfa'" v-model="newTask.params.direction">
+            <option value="both">both</option>
+            <option value="recv">recv</option>
+            <option value="send">send</option>
+          </select>
+          <select v-model.number="newTask.params.unit_base">
+            <option :value="1024">单位换算 1024</option>
+            <option :value="1000">单位换算 1000</option>
+          </select>
+          <select v-model="newTask.params.settlement_mode">
+            <option value="range_95">结算方式：月95</option>
+            <option value="daily_95_avg">结算方式：日95平均</option>
+          </select>
+          <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
+
+          <template v-if="newTask.data_source_type==='nfa'">
+            <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" /> V4/V6累加</label>
+            <select v-model="newTask.params.merge_key">
+              <option value="">合并键：不合并</option>
+              <option value="ipgroup_name_base">按名称去后缀(_V4/_V6)</option>
+              <option value="ipgroup_name">按IP组名称</option>
+              <option value="school_name_plus_cp">按学校名称+CP</option>
+              <option value="school_id">按学校ID</option>
+              <option value="school_name">按学校名称</option>
+            </select>
+            <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合</label>
+            <label><input type="checkbox" v-model="newTask.params.aggregate_all" /> 全部院校汇总</label>
+            <input v-model.number="newTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" />
+            <input v-model.trim="newTask.params.school" placeholder="指定院校(逗号分隔)" />
+            <input v-model.trim="newTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+          </template>
+
+          <input v-model.trim="newTask.params.sortby" placeholder="排序字段" />
+          <select v-model="newTask.params.sort_order">
+            <option value="desc">desc</option>
+            <option value="asc">asc</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="step step-final">
+        <h3>Step 4. 导出与提交</h3>
+        <div class="row">
+          <label><input type="checkbox" value="csv" v-model="newTask.export_formats" /> CSV</label>
+          <label><input type="checkbox" value="xlsx" v-model="newTask.export_formats" /> XLSX</label>
+          <input v-model.trim="newTask.output_filename_template" placeholder="命名模板，例如 {source}-{instance}-{window}" />
+          <button @click="createTask">创建任务</button>
+        </div>
+        <div class="meta-text">占位符：{province}、{cp}、{edc}、{source}、{instance}、{direction}、{window}、{date}</div>
+        <div class="meta-text">文件名预览：{{ filenamePreview(newTask) }}</div>
+      </div>
+    </section>
+
+    <section v-if="editTask" class="edit-panel">
+      <h2>编辑任务 #{{ editTask.id }}</h2>
       <div class="row">
         <input v-model.trim="editTask.name" placeholder="任务名" />
         <label><input type="checkbox" v-model="editTask.active" /> 启用</label>
+        <label>
+          数据源：
+          <select v-model="editTask.data_source_type">
+            <option value="nfa">NFA</option>
+            <option value="edc">EDC</option>
+          </select>
+        </label>
+        <label>
+          实例：
+          <select v-model="editTask.data_source_instance">
+            <option v-for="inst in getSourceInstances(editTask.data_source_type)" :key="'edit-inst-' + inst" :value="inst">{{ inst }}</option>
+          </select>
+        </label>
         <label>
           任务类型：
           <select v-model="editTask.kind">
@@ -187,36 +348,40 @@
           </select>
         </label>
       </div>
+      <div class="row">
+        <select v-model="editTask.window_selector">
+          <option value="custom">自定义</option>
+          <option value="last_week">上一周</option>
+          <option value="last_month">上一月</option>
+          <option value="last_n_days">最后N天</option>
+        </select>
+        <input v-if="editTask.window_selector==='last_n_days'" v-model.number="editTask.window_params.n" type="number" min="1" placeholder="N(天)" />
+        <input v-if="editTask.window_selector==='custom'" id="range-edit" placeholder="选择日期范围" />
+      </div>
       <div class="row" v-if="editTask.kind==='periodic'">
-        <label>
-          调度类型：
-          <select v-model="editTask.schedule_type">
-            <option :value="null">选择类型</option>
-            <option value="cron">cron</option>
-            <option value="interval">interval(秒)</option>
-            <option value="weekly_preset">weekly_preset(每周一)</option>
-          </select>
-        </label>
+        <select v-model="editTask.schedule_type">
+          <option :value="null">选择调度类型</option>
+          <option value="cron">cron</option>
+          <option value="interval">interval(秒)</option>
+          <option value="weekly_preset">weekly_preset(每周一)</option>
+        </select>
         <input v-if="editTask.schedule_type==='cron'" v-model.trim="editTask.schedule_expr" placeholder="cron 表达式，例如 */5 * * * *" />
         <input v-if="editTask.schedule_type==='interval'" v-model.number="editTask.schedule_expr" type="number" min="1" placeholder="间隔秒数，例如 3600" />
         <input v-if="editTask.schedule_type==='weekly_preset'" v-model.trim="editTask.schedule_time_of_day" placeholder="执行时刻 HH:MM:SS，例如 06:00:00" />
         <input v-model.trim="editTask.timezone" placeholder="时区，例如 Asia/Shanghai" />
       </div>
       <div class="row">
-        <span style="margin-right:6px;">时间范围：</span>
-        <select v-model="editTask.window_selector">
-          <option value="custom">自定义</option>
-          <option value="last_week">上一周</option>
-          <option value="last_n_days">最后N天</option>
-        </select>
-        <input v-if="editTask.window_selector==='last_n_days'" v-model.number="editTask.window_params.n" type="number" min="1" placeholder="N(天)" />
-        <input v-if="editTask.window_selector==='custom'" id="range-edit" placeholder="选择日期范围" />
-      </div>
-      <div class="row">
-        <span style="margin-right:6px;">匹配条件：</span>
-        <input v-model.trim="editTask.params.province" placeholder="省份，如四川省" />
-        <input v-model.trim="editTask.params.cp" placeholder="CP，如bilibili" />
-        <select v-model="editTask.params.direction">
+        <template v-if="editTask.data_source_type==='nfa'">
+          <input v-model.trim="editTask.params.province" placeholder="省份，如四川省" />
+          <input v-model.trim="editTask.params.cp" placeholder="CP，如bilibili" />
+        </template>
+        <template v-else>
+          <input v-model.trim="editTask.params.edc_name" placeholder="EDC名称，如 BJ-jinshan-*" />
+          <label><input type="checkbox" v-model="editTask.params.data_budget_enabled" /> 数据预算</label>
+          <input v-if="editTask.params.data_budget_enabled" v-model.number="editTask.params.data_budget_mul" type="number" step="0.0001" placeholder="乘数，如 8" />
+          <input v-if="editTask.params.data_budget_enabled" v-model.number="editTask.params.data_budget_div" type="number" step="0.0001" placeholder="除数，如 300" />
+        </template>
+        <select v-if="editTask.data_source_type==='nfa'" v-model="editTask.params.direction">
           <option value="both">both</option>
           <option value="recv">recv</option>
           <option value="send">send</option>
@@ -230,91 +395,169 @@
           <option value="daily_95_avg">结算方式：日95平均</option>
         </select>
         <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
-        <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" /> V4/V6累加</label>
-        <select v-model="editTask.params.merge_key">
-          <option value="">合并键：不合并</option>
-          <option value="ipgroup_name_base">合并键：按名称去后缀(_V4/_V6)</option>
-          <option value="ipgroup_name">合并键：按IP组名称</option>
-          <option value="school_name_plus_cp">合并键：学校名称+CP</option>
-          <option value="school_id">合并键：按学校ID</option>
-          <option value="school_name">合并键：按学校名称</option>
-        </select>
-        <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合</label>
-        <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
-        <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" style="width:140px" />
-        <input v-model.trim="editTask.params.school" placeholder="指定院校(逗号分隔)" />
-        <input v-model.trim="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
-        <input v-model.trim="editTask.params.sortby" placeholder="排序字段" />
-        <select v-model="editTask.params.sort_order">
-          <option value="desc">desc</option>
-          <option value="asc">asc</option>
-        </select>
       </div>
       <div class="row">
         <label><input type="checkbox" value="csv" v-model="editTask.export_formats" /> CSV</label>
         <label><input type="checkbox" value="xlsx" v-model="editTask.export_formats" /> XLSX</label>
-        <input v-model.trim="editTask.output_filename_template" placeholder="命名模板，可空，如 {province}-{cp}-{direction}-{window}" />
+        <input v-model.trim="editTask.output_filename_template" placeholder="命名模板，例如 {source}-{instance}-{window}" />
         <button @click="saveEdit">保存</button>
-        <button @click="cancelEdit">取消</button>
+        <button class="btn-muted" @click="cancelEdit">取消</button>
       </div>
-      <div class="row" style="margin-top:-8px; color:#666; font-size: 12px;">
-        可用占位符：{province}、{cp}、{direction}、{window}、{date}。示例：{province}-{cp}-{direction}-{window}.csv
-      </div>
-      <div class="row" style="margin-top:-8px; color:#333; font-size: 12px;">
-        文件名预览：{{ filenamePreview(editTask) }}
-      </div>
+      <div class="meta-text">文件名预览：{{ filenamePreview(editTask) }}</div>
     </section>
 
-    <section>
-      <h2>运行记录</h2>
-      <div class="row">
-        <button @click="loadRuns()">刷新</button>
-        <select v-model="runsQuery.status">
-          <option value="">全部状态</option>
-          <option value="pending">pending</option>
-          <option value="running">running</option>
-          <option value="succeeded">succeeded</option>
-          <option value="failed">failed</option>
-        </select>
-        <select v-model="runsQuery.sort_by">
-          <option value="started_at">按开始时间</option>
-          <option value="finished_at">按结束时间</option>
-          <option value="id">按ID</option>
-          <option value="status">按状态</option>
-        </select>
-        <select v-model="runsQuery.sort_order">
-          <option value="desc">降序</option>
-          <option value="asc">升序</option>
-        </select>
-        <button @click="applyRunsQuery">应用</button>
-        <button @click="clearRunsFilter">清除筛选</button>
-      </div>
-      <table class="table">
-        <thead>
-          <tr>
-            <th>ID</th><th>任务ID</th><th>状态</th><th>开始</th><th>结束</th><th>产物</th><th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="r in runs" :key="r.id">
-            <td>{{ r.id }}</td>
-            <td>{{ r.task_id }}</td>
-            <td>{{ r.status }}</td>
-            <td>{{ r.started_at }}</td>
-            <td>{{ r.finished_at }}</td>
-            <td>
-              <div v-for="a in r.artifacts" :key="a.filename">
-                <a :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(a.filename)" target="_blank">{{ a.filename }}</a>
+    <div class="workspace-grid">
+      <section>
+        <div class="panel-head">
+          <h2>任务列表</h2>
+          <div class="row">
+            <button @click="loadTasks">刷新任务列表</button>
+            <input v-model.trim="tasksQuery.q" placeholder="搜索任务名" />
+            <button @click="applyTasksQuery">应用</button>
+            <button class="btn-muted" @click="selectAllTasksOnPage">本页全选</button>
+            <button class="btn-muted" @click="clearTaskSelection">清空选择</button>
+            <button @click="batchRunTasks">批量运行</button>
+            <button class="btn-danger" @click="batchDeleteTasks">批量删除</button>
+          </div>
+        </div>
+        <div class="list-wrap">
+          <div class="item-card" v-for="t in tasks" :key="t.id">
+            <label class="pick">
+              <input type="checkbox" :checked="taskChecked(t.id)" @change="toggleTaskSelect(t.id)" />
+            </label>
+            <div class="item-main">
+              <div class="item-title">{{ t.name }}</div>
+              <div class="item-meta">
+                <span class="chip">#{{ t.id }}</span>
+                <span class="chip">{{ (t.data_source_type || 'nfa').toUpperCase() }}/{{ t.data_source_instance || 'default' }}</span>
+                <span class="chip">{{ t.kind === 'periodic' ? '周期性' : '一次性' }}</span>
+                <span class="chip">{{ t.active ? '已启用' : '已暂停' }}</span>
+                <span class="chip">窗口 {{ t.window_selector }}</span>
               </div>
-            </td>
-            <td>
-              <button @click="deleteRun(r.id)">删除</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-      <div class="row">
-        <div>
+              <div class="item-sub">调度：{{ scheduleSummary(t) }} | 下次：{{ formatDateTimeShort(t.next_run_time) }}</div>
+              <div class="budget-box" v-if="t.latest_budget_summary">
+                <div class="budget-title">预算结算（{{ t.latest_budget_summary.year_month || '-' }}）</div>
+                <div class="budget-grid">
+                  <span>日95月平均(1000)</span><b>{{ formatBudgetValue(t.latest_budget_summary.daily_95_avg_1000, 1000) }}</b>
+                  <span>月95(1000)</span><b>{{ formatBudgetValue(t.latest_budget_summary.range_95_1000, 1000) }}</b>
+                  <span>日95月平均(1024)</span><b>{{ formatBudgetValue(t.latest_budget_summary.daily_95_avg_1024, 1024) }}</b>
+                  <span>月95(1024)</span><b>{{ formatBudgetValue(t.latest_budget_summary.range_95_1024, 1024) }}</b>
+                </div>
+                <details class="budget-detail">
+                  <summary>查看计算过程</summary>
+                  <div class="budget-steps">
+                    <div>来源：{{ t.latest_budget_summary.source_table || '-' }}.{{ t.latest_budget_summary.source_value_column || '-' }}</div>
+                    <div>公式：{{ t.latest_budget_summary.formula || '-' }}</div>
+                    <div>匹配：{{ t.latest_budget_summary.match_operator || '-' }} {{ t.latest_budget_summary.effective_pattern || '-' }}（mode={{ t.latest_budget_summary.match_mode || '-' }}）</div>
+                    <div>排除：{{ t.latest_budget_summary.exclude_like == null ? '无' : t.latest_budget_summary.exclude_like }}</div>
+                    <div>日95月平均：raw={{ Number(t.latest_budget_summary.raw_daily_95_avg || 0).toFixed(6) }} → step1={{ Number(t.latest_budget_summary.raw_daily_95_avg_step1 || 0).toFixed(6) }}</div>
+                    <div>月95：raw={{ Number(t.latest_budget_summary.raw_range_95 || 0).toFixed(6) }} → step1={{ Number(t.latest_budget_summary.raw_range_95_step1 || 0).toFixed(6) }}</div>
+                    <div>样本：daily_days={{ t.latest_budget_summary.daily_days || 0 }}, range_points={{ t.latest_budget_summary.range_points || 0 }}</div>
+                  </div>
+                </details>
+              </div>
+            </div>
+            <div class="actions">
+              <button @click="toggleActive(t)">{{ t.active ? '暂停' : '启用' }}</button>
+              <button @click="startEdit(t)">编辑</button>
+              <button @click="runTask(t.id)">运行</button>
+              <button @click="viewRuns(t.id)">记录</button>
+              <button class="btn-danger" @click="removeTask(t.id)">删除</button>
+            </div>
+          </div>
+        </div>
+        <div class="row pager">
+          <label>每页：
+            <select v-model.number="tasksPage.page_size" @change="changeTasksPageSize">
+              <option :value="10">10</option>
+              <option :value="20">20</option>
+              <option :value="50">50</option>
+              <option :value="100">100</option>
+            </select>
+          </label>
+          <button @click="prevTasksPage">上一页</button>
+          <button @click="nextTasksPage">下一页</button>
+          <span>第 {{ tasksPage.page }} / {{ totalPages(tasksPage.total, tasksPage.page_size) }} 页（共 {{ tasksPage.total }} 条）</span>
+          <input v-model.number="tasksPageJump" type="number" min="1" style="width:80px" />
+          <button @click="jumpTasksPage">跳转</button>
+        </div>
+      </section>
+
+      <section>
+        <div class="panel-head">
+          <h2>运行记录</h2>
+          <div class="row">
+            <button @click="loadRuns()">刷新</button>
+            <select v-model="runsQuery.status">
+              <option value="">全部状态</option>
+              <option value="pending">pending</option>
+              <option value="running">running</option>
+              <option value="succeeded">succeeded</option>
+              <option value="failed">failed</option>
+            </select>
+            <input type="month" v-model="runsQuery.month" />
+            <select v-model="runsQuery.task_kind">
+              <option value="all">全部任务类型</option>
+              <option value="periodic">仅周期性</option>
+              <option value="one_off">仅一次性</option>
+            </select>
+            <select v-model="runsQuery.file_format">
+              <option value="csv">CSV</option>
+              <option value="xlsx">XLSX</option>
+              <option value="all">全部格式</option>
+            </select>
+            <button @click="applyRunsQuery">应用</button>
+            <button class="btn-muted" @click="clearRunsFilter">清除筛选</button>
+            <button class="btn-muted" @click="selectAllRunsOnPage">本页全选</button>
+            <button class="btn-muted" @click="clearRunSelection">清空选择</button>
+            <button class="btn-danger" @click="batchDeleteRuns">批量删除</button>
+            <button @click="batchDownloadRuns">批量下载ZIP</button>
+            <span class="hint">预计 {{ downloadPreview.matched_runs }} 条运行 / {{ downloadPreview.matched_files }} 个文件</span>
+          </div>
+        </div>
+        <div class="list-wrap">
+          <template v-for="group in ['running','pending','failed','succeeded']" :key="'g-' + group">
+            <div class="group-head" v-if="runsByStatus(group).length > 0">
+              <span :class="['run-status', 'st-' + group]">{{ group }}</span>
+              <span>{{ runsByStatus(group).length }} 条</span>
+            </div>
+            <div class="item-card run-card" v-for="r in runsByStatus(group)" :key="r.id">
+              <label class="pick">
+                <input type="checkbox" :checked="runChecked(r.id)" @change="toggleRunSelect(r.id)" />
+              </label>
+              <div class="item-main">
+                <div class="item-title">
+                  <span :class="['run-status', 'st-' + r.status]">{{ r.status }}</span>
+                  <span :title="r.id">#{{ shortId(r.id, 10) }}</span>
+                  <span class="chip">任务 {{ r.task_id || '-' }}</span>
+                </div>
+                <div class="item-sub">
+                  开始：{{ formatDateTimeShort(r.started_at) }} | 结束：{{ formatDateTimeShort(r.finished_at) }}
+                </div>
+                <div class="item-sub" v-if="r.progress_stage">
+                  进度：{{ r.progress_pct || 0 }}% · {{ r.progress_stage }}
+                </div>
+                <div class="progress" v-if="r.status==='running' || r.status==='pending'">
+                  <div class="progress-inner" :style="{ width: (r.progress_pct || 0) + '%' }"></div>
+                </div>
+                <div class="timeline" v-if="timelineEvents(r).length">
+                  <div class="timeline-row" v-for="(e, idx) in timelineEvents(r)" :key="r.id + '-e-' + idx">
+                    <span class="tl-time">{{ formatDateTimeShort(e.time) }}</span>
+                    <span class="tl-stage">{{ e.stage }}</span>
+                    <span class="tl-pct">{{ e.pct }}%</span>
+                  </div>
+                </div>
+                <div class="artifact-list">
+                  <a v-for="a in r.artifacts" :key="a.filename" :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(a.filename)" target="_blank">{{ a.filename }}</a>
+                </div>
+              </div>
+              <div class="actions">
+                <button class="btn-danger" @click="deleteRun(r.id)">删除</button>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="row pager">
           <label>每页：
             <select v-model.number="runsPage.page_size" @change="changeRunsPageSize">
               <option :value="10">10</option>
@@ -325,14 +568,13 @@
           </label>
           <button @click="prevRunsPage">上一页</button>
           <button @click="nextRunsPage">下一页</button>
-          <span style="margin-left:8px;">第 {{ runsPage.page }} / {{ totalPages(runsPage.total, runsPage.page_size) }} 页（共 {{ runsPage.total }} 条）</span>
-          <span style="margin-left:12px;">跳转到页：</span>
+          <span>第 {{ runsPage.page }} / {{ totalPages(runsPage.total, runsPage.page_size) }} 页（共 {{ runsPage.total }} 条）</span>
           <input v-model.number="runsPageJump" type="number" min="1" style="width:80px" />
           <button @click="jumpRunsPage">跳转</button>
         </div>
-      </div>
-    </section>
+      </section>
+    </div>
   </div>
-  <script src="/static/app.js?v=20251103-01"></script>
+  <script src="/static/app.js?v=20260303-03"></script>
 </body>
 </html>

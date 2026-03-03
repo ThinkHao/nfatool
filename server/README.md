@@ -38,6 +38,14 @@ uvicorn server.main:app --reload --port 8000
 - 并发执行限制为 `CONCURRENCY_LIMIT`（默认 3）
 - 结果与日志位于 `server/storage/` 与 `server/logs/`
 - 清理任务每日 03:30 执行，删除超过 `RETENTION_DAYS` 的运行与产物
+- 支持多数据源任务：`data_source_type` 取值 `nfa` / `edc`，并可通过 `data_source_instance` 选择具体数据库实例
+- 可通过 `GET /api/meta/data-sources` 查看已配置实例列表（需 API Key）
+
+### 多数据源配置建议
+
+- NFA 任务参数示例：`params.province`、`params.cp`、`params.direction`
+- EDC 任务参数示例：`params.edc_name`（支持 `*` 通配），结算可配 `params.settlement_mode`（`range_95` / `daily_95_avg`）
+- 在 `.env` 中使用 `NFA_INSTANCES_JSON` / `EDC_INSTANCES_JSON` 配置多实例；若未配置 NFA 实例，仍兼容原 `MYSQL_*` 单实例配置
 
 ## 打包为单文件可执行（Windows）
 

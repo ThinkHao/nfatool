@@ -16,6 +16,8 @@ class Task(Base):
     name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     kind: Mapped[Optional[str]] = mapped_column(String(20), default="one_off")
+    data_source_type: Mapped[str] = mapped_column(String(20), default="nfa")
+    data_source_instance: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
 
     # schedule
     schedule_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)  # cron | interval | weekly_preset
@@ -33,6 +35,7 @@ class Task(Base):
     # export
     export_formats: Mapped[str] = mapped_column(Text, default='["csv"]')  # JSON array string
     output_filename_template: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    latest_budget_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON object
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -47,6 +50,9 @@ class JobRun(Base):
     task_id: Mapped[Optional[int]] = mapped_column(ForeignKey("tasks.id"), nullable=True)
 
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|running|succeeded|failed
+    progress_pct: Mapped[int] = mapped_column(Integer, default=0)
+    progress_stage: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    progress_events: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON array
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 

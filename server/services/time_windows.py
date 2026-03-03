@@ -19,6 +19,15 @@ def resolve_time_window(selector: str, params: dict[str, Any] | None, tz_name: s
         end = last_sunday_end.replace(microsecond=0)
         window_label = f"{start:%Y%m%d}-{end:%Y%m%d}"
         return start.strftime('%Y-%m-%d %H:%M:%S'), end.strftime('%Y-%m-%d %H:%M:%S'), window_label
+    elif selector == "last_month":
+        # previous natural month: first day 00:00:00 to last day 23:59:59
+        this_month_first = datetime(now.year, now.month, 1, tzinfo=tz)
+        last_month_end = this_month_first - timedelta(seconds=1)
+        last_month_start = datetime(last_month_end.year, last_month_end.month, 1, tzinfo=tz)
+        start = last_month_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = last_month_end.replace(microsecond=0)
+        window_label = f"{start:%Y%m%d}-{end:%Y%m%d}"
+        return start.strftime('%Y-%m-%d %H:%M:%S'), end.strftime('%Y-%m-%d %H:%M:%S'), window_label
     elif selector == "last_n_days":
         n = int((params or {}).get("n", 7))
         end = now.replace(hour=23, minute=59, second=59, microsecond=0)

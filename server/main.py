@@ -2,30 +2,54 @@ from __future__ import annotations
 
 import json
 import shutil
+import zipfile
+from datetime import datetime
 from pathlib import Path
 import sys
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import and_, func, or_
+import pymysql
 
-from .config import get_settings, BASE_DIR
+from .config import (
+    get_settings,
+    BASE_DIR,
+    get_data_source_catalog,
+    get_data_source_instances,
+    list_data_source_instances,
+    upsert_runtime_data_source_instance,
+    delete_runtime_data_source_instance,
+    list_data_source_config_audit,
+    rotate_data_source_encryption_key,
+    get_data_key_rotation_status,
+    set_data_key_rotation_policy,
+    auto_rotate_data_source_key,
+)
 from .db import init_db, session_scope
 from .models import Task, JobRun
-from .schemas import TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut
+from .schemas import (
+    TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut,
+    TaskBatchDelete, JobBatchDelete, JobBatchDownload,
+    DataSourceInstancePayload, DataSourceTestPayload, DataSourceRotateKeyPayload, DataSourceRotatePolicyPayload,
+)
 from .security import api_key_auth
 from .services.scheduler import (
     create_ad_hoc_job_run,
     create_job_run_from_task,
     load_tasks_into_scheduler,
     schedule_retention_cleanup,
+    schedule_config_key_rotation,
 )
-from .services.scheduler import scheduler, apply_schedule_for_task_snapshot
+from .services.scheduler import apply_schedule_for_task_snapshot
+from .services import scheduler as scheduler_service
 from .services.storage import get_job_dir
 from .services.logger import get_job_log_path
+from .services.compute95 import _connect_edc_db
 
 app = FastAPI(title="NFA 95th Web Service", version="0.1.0")
 
@@ -65,21 +89,22 @@ def on_startup():
     init_db()
     load_tasks_into_scheduler()
     schedule_retention_cleanup()
+    schedule_config_key_rotation()
 
 
 @app.on_event("shutdown")
 def on_shutdown():
     try:
-        if scheduler:
-            scheduler.shutdown(wait=False)
+        if scheduler_service.scheduler:
+            scheduler_service.scheduler.shutdown(wait=False)
     except Exception:
         pass
 
 
 def _get_next_run_time(task_id: int):
     try:
-        if scheduler:
-            job = scheduler.get_job(f"task-{task_id}")
+        if scheduler_service.scheduler:
+            job = scheduler_service.scheduler.get_job(f"task-{task_id}")
             if job and job.next_run_time:
                 return job.next_run_time
     except Exception:
@@ -136,6 +161,147 @@ async def meta_paths():
         "sqlite_url": s.SQLITE_URL,
     }
 
+@app.get("/api/meta/data-sources", dependencies=[Depends(api_key_auth)])
+async def meta_data_sources():
+    return get_data_source_catalog()
+
+
+def _test_nfa_connection(cfg: dict) -> None:
+    db_cfg = {
+        "host": cfg.get("host"),
+        "port": int(cfg.get("port", 3306)),
+        "user": cfg.get("user"),
+        "password": cfg.get("password"),
+        "db": cfg.get("db"),
+        "charset": cfg.get("charset", "utf8mb4"),
+    }
+    if not (db_cfg["host"] and db_cfg["user"] and db_cfg["password"] and db_cfg["db"]):
+        raise ValueError("NFA instance config must include host/port/user/password/db")
+    conn = pymysql.connect(
+        host=db_cfg["host"],
+        port=db_cfg["port"],
+        user=db_cfg["user"],
+        password=db_cfg["password"],
+        db=db_cfg["db"],
+        charset=db_cfg["charset"],
+        connect_timeout=8,
+        read_timeout=10,
+        write_timeout=10,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 AS ok")
+            cursor.fetchall()
+    finally:
+        conn.close()
+
+
+@app.get("/api/meta/data-sources/instances", dependencies=[Depends(api_key_auth)])
+async def list_data_source_instances_api(source_type: str = Query(default="all")):
+    st = (source_type or "all").lower()
+    if st == "all":
+        items = list_data_source_instances("nfa") + list_data_source_instances("edc")
+    else:
+        items = list_data_source_instances(st)
+    items = sorted(items, key=lambda x: (str(x.get("source_type") or ""), str(x.get("instance") or "")))
+    return {"items": items}
+
+
+@app.post("/api/meta/data-sources/instances", dependencies=[Depends(api_key_auth)])
+async def save_data_source_instance_api(payload: DataSourceInstancePayload, request: Request):
+    try:
+        actor = f"{request.client.host if request.client else 'unknown'}"
+        upsert_runtime_data_source_instance(payload.source_type, payload.instance, payload.config or {}, actor=actor)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
+
+
+@app.delete("/api/meta/data-sources/instances", dependencies=[Depends(api_key_auth)])
+async def delete_data_source_instance_api(request: Request, source_type: str = Query(...), instance: str = Query(...)):
+    actor = f"{request.client.host if request.client else 'unknown'}"
+    removed = delete_runtime_data_source_instance(source_type, instance, actor=actor)
+    return {"ok": True, "deleted": 1 if removed else 0}
+
+
+@app.get("/api/meta/data-sources/audit", dependencies=[Depends(api_key_auth)])
+async def list_data_source_audit_api(limit: int = Query(default=100, ge=1, le=500)):
+    return {"items": list_data_source_config_audit(limit=limit)}
+
+
+@app.post("/api/meta/data-sources/rotate-key", dependencies=[Depends(api_key_auth)])
+async def rotate_data_source_key_api(payload: DataSourceRotateKeyPayload):
+    try:
+        result = rotate_data_source_encryption_key(payload.old_seed, payload.new_seed)
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/meta/data-sources/rotate-policy", dependencies=[Depends(api_key_auth)])
+async def get_rotate_policy_api():
+    return {"ok": True, **get_data_key_rotation_status()}
+
+
+@app.post("/api/meta/data-sources/rotate-policy", dependencies=[Depends(api_key_auth)])
+async def set_rotate_policy_api(payload: DataSourceRotatePolicyPayload):
+    try:
+        status = set_data_key_rotation_policy(bool(payload.enabled), int(payload.interval_days))
+        return {"ok": True, **status}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/meta/data-sources/rotate-key-auto", dependencies=[Depends(api_key_auth)])
+async def rotate_key_auto_api(force: bool = Query(default=True)):
+    try:
+        result = auto_rotate_data_source_key(force=bool(force))
+        return {"ok": True, **result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/meta/data-sources/test", dependencies=[Depends(api_key_auth)])
+async def test_data_source_connection_api(payload: DataSourceTestPayload):
+    source_type = (payload.source_type or "nfa").lower()
+    cfg = payload.config
+    if cfg is None:
+        if not payload.instance:
+            raise HTTPException(status_code=400, detail="instance or config is required")
+        inst = get_data_source_instances(source_type)
+        if payload.instance not in inst:
+            raise HTTPException(status_code=404, detail=f"instance not found: {payload.instance}")
+        cfg = inst[payload.instance]
+    if not isinstance(cfg, dict):
+        raise HTTPException(status_code=400, detail="config must be object")
+
+    started = datetime.now()
+    try:
+        if source_type == "edc":
+            conn, tunnel = _connect_edc_db(cfg)
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT 1 AS ok")
+                    cursor.fetchall()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    if tunnel is not None:
+                        tunnel.stop()
+                except Exception:
+                    pass
+        else:
+            _test_nfa_connection(cfg)
+        elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
+        return {"ok": True, "message": "connection ok", "elapsed_ms": elapsed_ms}
+    except Exception as e:
+        elapsed_ms = int((datetime.now() - started).total_seconds() * 1000)
+        return {"ok": False, "message": str(e), "elapsed_ms": elapsed_ms}
+
 
 # Tasks CRUD
 @app.post("/api/tasks", response_model=TaskOut, dependencies=[Depends(api_key_auth)])
@@ -147,6 +313,8 @@ async def create_task(payload: TaskCreate):
             name=payload.name,
             active=payload.active,
             kind=payload.kind,
+            data_source_type=payload.data_source_type or "nfa",
+            data_source_instance=payload.data_source_instance or "default",
             schedule_type=payload.schedule_type,
             schedule_expr=payload.schedule_expr,
             schedule_time_of_day=payload.schedule_time_of_day,
@@ -177,6 +345,8 @@ async def create_task(payload: TaskCreate):
             name=t.name,
             active=t.active,
             kind=t.kind,
+            data_source_type=t.data_source_type or "nfa",
+            data_source_instance=t.data_source_instance or "default",
             schedule_type=t.schedule_type,
             schedule_expr=t.schedule_expr,
             schedule_time_of_day=t.schedule_time_of_day,
@@ -189,6 +359,7 @@ async def create_task(payload: TaskCreate):
             created_at=t.created_at,
             updated_at=t.updated_at,
             next_run_time=_get_next_run_time(t.id),
+            latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
         )
 
 
@@ -203,6 +374,8 @@ async def list_tasks():
                 name=t.name,
                 active=t.active,
                 kind=t.kind,
+                data_source_type=t.data_source_type or "nfa",
+                data_source_instance=t.data_source_instance or "default",
                 schedule_type=t.schedule_type,
                 schedule_expr=t.schedule_expr,
                 schedule_time_of_day=t.schedule_time_of_day,
@@ -215,6 +388,7 @@ async def list_tasks():
                 created_at=t.created_at,
                 updated_at=t.updated_at,
                 next_run_time=_get_next_run_time(t.id),
+                latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
             ))
         return out
 
@@ -225,16 +399,35 @@ async def list_jobs_page(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     status: Optional[str] = Query(default=None),
+    month: Optional[str] = Query(default=None),  # YYYY-MM
+    task_kind: Optional[str] = Query(default="all"),  # all|periodic|one_off
     sort_by: Optional[str] = Query(default="started_at"),
     sort_order: Optional[str] = Query(default="desc")
 ):
     with session_scope() as s:
-        base = s.query(JobRun)
+        base = s.query(JobRun).outerjoin(Task, JobRun.task_id == Task.id)
         if task_id is not None:
             base = base.filter(JobRun.task_id == task_id)
         if status:
             try:
                 base = base.filter(JobRun.status == status)
+            except Exception:
+                pass
+        tk = (task_kind or "all").lower()
+        if tk in {"periodic", "one_off"}:
+            if tk == "one_off":
+                base = base.filter(or_(Task.kind == "one_off", JobRun.task_id.is_(None)))
+            else:
+                base = base.filter(Task.kind == "periodic")
+        if month:
+            try:
+                m = datetime.strptime(month, "%Y-%m")
+                if m.month == 12:
+                    m2 = datetime(m.year + 1, 1, 1)
+                else:
+                    m2 = datetime(m.year, m.month + 1, 1)
+                ts_col = func.coalesce(JobRun.finished_at, JobRun.started_at)
+                base = base.filter(and_(ts_col >= m, ts_col < m2))
             except Exception:
                 pass
         total = base.count()
@@ -258,6 +451,11 @@ async def list_jobs_page(
             rows = base.order_by((JobRun.started_at.is_(None)).asc(), order_clause).offset((page - 1) * page_size).limit(page_size).all()
         else:
             rows = base.order_by(order_clause).offset((page - 1) * page_size).limit(page_size).all()
+        task_ids = [r.task_id for r in rows if r.task_id is not None]
+        task_kind_map: dict[int, str] = {}
+        if task_ids:
+            trows = s.query(Task).filter(Task.id.in_(task_ids)).all()
+            task_kind_map = {t.id: (t.kind or "one_off") for t in trows}
         items: list[JobRunOut] = []
         for r in rows:
             artifacts = []
@@ -268,7 +466,11 @@ async def list_jobs_page(
             items.append(JobRunOut(
                 id=r.id,
                 task_id=r.task_id,
+                task_kind=("one_off" if not r.task_id else task_kind_map.get(r.task_id)),
                 status=r.status,
+                progress_pct=(r.progress_pct or 0),
+                progress_stage=r.progress_stage,
+                progress_events=(json.loads(r.progress_events) if r.progress_events else []),
                 started_at=r.started_at,
                 finished_at=r.finished_at,
                 resolved_window=json.loads(r.resolved_window) if r.resolved_window else None,
@@ -316,6 +518,8 @@ async def list_tasks_page(
                 name=t.name,
                 active=t.active,
                 kind=t.kind,
+                data_source_type=t.data_source_type or "nfa",
+                data_source_instance=t.data_source_instance or "default",
                 schedule_type=t.schedule_type,
                 schedule_expr=t.schedule_expr,
                 schedule_time_of_day=t.schedule_time_of_day,
@@ -328,6 +532,7 @@ async def list_tasks_page(
                 created_at=t.created_at,
                 updated_at=t.updated_at,
                 next_run_time=_get_next_run_time(t.id),
+                latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
             ))
         return TaskPageOut(items=items, total=total, page=page, page_size=page_size)
 
@@ -343,6 +548,8 @@ async def get_task(task_id: int):
             name=t.name,
             active=t.active,
             kind=t.kind,
+            data_source_type=t.data_source_type or "nfa",
+            data_source_instance=t.data_source_instance or "default",
             schedule_type=t.schedule_type,
             schedule_expr=t.schedule_expr,
             schedule_time_of_day=t.schedule_time_of_day,
@@ -355,6 +562,7 @@ async def get_task(task_id: int):
             created_at=t.created_at,
             updated_at=t.updated_at,
             next_run_time=_get_next_run_time(t.id),
+            latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
         )
 
 
@@ -391,6 +599,8 @@ async def update_task(task_id: int, payload: TaskUpdate):
             name=t.name,
             active=t.active,
             kind=t.kind,
+            data_source_type=t.data_source_type or "nfa",
+            data_source_instance=t.data_source_instance or "default",
             schedule_type=t.schedule_type,
             schedule_expr=t.schedule_expr,
             schedule_time_of_day=t.schedule_time_of_day,
@@ -403,6 +613,7 @@ async def update_task(task_id: int, payload: TaskUpdate):
             created_at=t.created_at,
             updated_at=t.updated_at,
             next_run_time=_get_next_run_time(t.id),
+            latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
         )
 
 
@@ -415,16 +626,42 @@ async def delete_task(task_id: int):
         s.delete(t)
     # Remove scheduled job if exists
     try:
-        if scheduler:
-            scheduler.remove_job(f"task-{task_id}")
+        if scheduler_service.scheduler:
+            scheduler_service.scheduler.remove_job(f"task-{task_id}")
     except Exception:
         pass
     return {"ok": True}
 
 
+@app.post("/api/tasks/batch-delete", dependencies=[Depends(api_key_auth)])
+async def batch_delete_tasks(payload: TaskBatchDelete):
+    ids = [int(x) for x in (payload.ids or []) if str(x).isdigit()]
+    if not ids:
+        return {"ok": True, "deleted": 0}
+    deleted = 0
+    with session_scope() as s:
+        rows = s.query(Task).filter(Task.id.in_(ids)).all()
+        for t in rows:
+            s.delete(t)
+            deleted += 1
+    try:
+        if scheduler:
+            for tid in ids:
+                try:
+                    scheduler.remove_job(f"task-{tid}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {"ok": True, "deleted": deleted}
+
+
 @app.post("/api/tasks/{task_id}/run", dependencies=[Depends(api_key_auth)])
 async def trigger_task_run(task_id: int):
-    job_id = create_job_run_from_task(task_id)
+    try:
+        job_id = create_job_run_from_task(task_id)
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return {"job_id": job_id}
 
 
@@ -444,6 +681,11 @@ async def list_jobs(task_id: Optional[int] = Query(default=None)):
             q = q.filter(JobRun.task_id == task_id)
         # SQLite 不支持 NULLS LAST 语法，这里改为先按 IS NULL 升序，再按时间降序，实现等价效果
         rows = q.order_by((JobRun.started_at.is_(None)).asc(), JobRun.started_at.desc()).limit(200).all()
+        task_ids = [r.task_id for r in rows if r.task_id is not None]
+        task_kind_map: dict[int, str] = {}
+        if task_ids:
+            trows = s.query(Task).filter(Task.id.in_(task_ids)).all()
+            task_kind_map = {t.id: (t.kind or "one_off") for t in trows}
         for r in rows:
             artifacts = []
             try:
@@ -453,7 +695,11 @@ async def list_jobs(task_id: Optional[int] = Query(default=None)):
             row = JobRunOut(
                 id=r.id,
                 task_id=r.task_id,
+                task_kind=("one_off" if not r.task_id else task_kind_map.get(r.task_id)),
                 status=r.status,
+                progress_pct=(r.progress_pct or 0),
+                progress_stage=r.progress_stage,
+                progress_events=(json.loads(r.progress_events) if r.progress_events else []),
                 started_at=r.started_at,
                 finished_at=r.finished_at,
                 resolved_window=json.loads(r.resolved_window) if r.resolved_window else None,
@@ -472,6 +718,10 @@ async def get_job(job_id: str):
         r = s.get(JobRun, job_id)
         if not r:
             raise HTTPException(status_code=404, detail="Job not found")
+        tk = "one_off"
+        if r.task_id:
+            t = s.get(Task, r.task_id)
+            tk = (t.kind if t else None)
         artifacts = []
         try:
             artifacts = json.loads(r.artifacts) if r.artifacts else []
@@ -480,7 +730,11 @@ async def get_job(job_id: str):
         return JobRunOut(
             id=r.id,
             task_id=r.task_id,
+            task_kind=tk,
             status=r.status,
+            progress_pct=(r.progress_pct or 0),
+            progress_stage=r.progress_stage,
+            progress_events=(json.loads(r.progress_events) if r.progress_events else []),
             started_at=r.started_at,
             finished_at=r.finished_at,
             resolved_window=json.loads(r.resolved_window) if r.resolved_window else None,
@@ -504,8 +758,8 @@ async def download_artifact(job_id: str, file: str):
 async def delete_job(job_id: str):
     # Cancel scheduled run if still pending in scheduler
     try:
-        if scheduler:
-            scheduler.remove_job(job_id)
+        if scheduler_service.scheduler:
+            scheduler_service.scheduler.remove_job(job_id)
     except Exception:
         pass
     # Remove artifacts directory and log file
@@ -527,3 +781,114 @@ async def delete_job(job_id: str):
         if r:
             s.delete(r)
     return {"ok": True}
+
+
+@app.post("/api/jobs/batch-delete", dependencies=[Depends(api_key_auth)])
+async def batch_delete_jobs(payload: JobBatchDelete):
+    ids = [str(x).strip() for x in (payload.ids or []) if str(x).strip()]
+    if not ids:
+        return {"ok": True, "deleted": 0}
+    deleted = 0
+    for jid in ids:
+        try:
+            if scheduler_service.scheduler:
+                try:
+                    scheduler_service.scheduler.remove_job(jid)
+                except Exception:
+                    pass
+            d = get_job_dir(jid)
+            if d.exists():
+                shutil.rmtree(d, ignore_errors=True)
+            log_path = get_job_log_path(jid)
+            if log_path.exists():
+                log_path.unlink(missing_ok=True)
+            with session_scope() as s:
+                r = s.get(JobRun, jid)
+                if r:
+                    s.delete(r)
+                    deleted += 1
+        except Exception:
+            pass
+    return {"ok": True, "deleted": deleted}
+
+
+def _resolve_batch_download_files(payload: JobBatchDownload) -> tuple[list[tuple[str, Path]], str, str]:
+    fmt = (payload.file_format or "csv").lower()
+    if fmt not in {"all", "csv", "xlsx"}:
+        fmt = "csv"
+    status = (payload.status or "succeeded").lower()
+    task_kind = (payload.task_kind or "all").lower()
+
+    rows: list[JobRun] = []
+    with session_scope() as s:
+        q = s.query(JobRun).outerjoin(Task, JobRun.task_id == Task.id)
+        if payload.run_ids:
+            ids = [str(x).strip() for x in payload.run_ids if str(x).strip()]
+            q = q.filter(JobRun.id.in_(ids))
+        else:
+            if status != "all":
+                q = q.filter(JobRun.status == status)
+            if task_kind in {"periodic", "one_off"}:
+                if task_kind == "one_off":
+                    q = q.filter(or_(Task.kind == "one_off", JobRun.task_id.is_(None)))
+                else:
+                    q = q.filter(Task.kind == "periodic")
+            if payload.month:
+                try:
+                    m = datetime.strptime(payload.month, "%Y-%m")
+                    if m.month == 12:
+                        m2 = datetime(m.year + 1, 1, 1)
+                    else:
+                        m2 = datetime(m.year, m.month + 1, 1)
+                    ts_col = func.coalesce(JobRun.finished_at, JobRun.started_at)
+                    q = q.filter(and_(ts_col >= m, ts_col < m2))
+                except Exception:
+                    pass
+        rows = q.order_by(JobRun.started_at.desc()).all()
+
+    files: list[tuple[str, Path]] = []
+    for r in rows:
+        if r.status != "succeeded":
+            continue
+        artifacts = []
+        try:
+            artifacts = json.loads(r.artifacts) if r.artifacts else []
+        except Exception:
+            artifacts = []
+        for a in artifacts:
+            fn = str(a.get("filename") or "").strip()
+            if not fn:
+                continue
+            suffix = Path(fn).suffix.lower().lstrip(".")
+            if fmt != "all" and suffix != fmt:
+                continue
+            p = get_job_dir(r.id) / fn
+            if p.exists() and p.is_file():
+                files.append((f"{r.id}/{fn}", p))
+    return files, task_kind, fmt
+
+
+@app.post("/api/jobs/batch-download/preview", dependencies=[Depends(api_key_auth)])
+async def batch_download_preview(payload: JobBatchDownload):
+    files, _, _ = _resolve_batch_download_files(payload)
+    run_ids = {str(arc).split("/", 1)[0] for arc, _ in files}
+    return {"matched_runs": len(run_ids), "matched_files": len(files)}
+
+
+@app.post("/api/jobs/batch-download", dependencies=[Depends(api_key_auth)])
+async def batch_download_jobs(payload: JobBatchDownload):
+    files, task_kind, fmt = _resolve_batch_download_files(payload)
+
+    if not files:
+        raise HTTPException(status_code=404, detail="No artifacts matched current filters")
+
+    storage_dir = Path(get_settings().STORAGE_DIR)
+    dl_dir = storage_dir / "downloads"
+    dl_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"artifacts_{payload.month or 'all'}_{task_kind}_{fmt}_{ts}.zip"
+    zip_path = dl_dir / zip_name
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for arc, p in files:
+            zf.write(p, arcname=arc)
+    return FileResponse(path=str(zip_path), filename=zip_name, media_type="application/zip")

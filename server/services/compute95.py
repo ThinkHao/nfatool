@@ -1,27 +1,189 @@
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path as _Path
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
+import time
 
 import pandas as pd
+import pymysql
+import paramiko
 
 # Reuse existing script functions (vendored under server/ext)
 from ..ext import calculate_95th_percentile as c95
 
-from ..config import get_settings
+from ..config import get_data_source_instances
 from .exporter import export_csv, export_xlsx
-from .storage import safe_artifact_path
+from .storage import get_job_dir, safe_artifact_path
+
+
+def _as_bool(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    s = str(v or "").strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _connect_edc_db(cfg: Dict[str, Any]) -> tuple[Any, Any]:
+    db_cfg = {
+        "host": cfg.get("host"),
+        "port": int(cfg.get("port", 3306)),
+        "user": cfg.get("user"),
+        "password": cfg.get("password"),
+        "db": cfg.get("db"),
+        "charset": cfg.get("charset", "utf8mb4"),
+    }
+    if not (db_cfg["host"] and db_cfg["user"] and db_cfg["password"] and db_cfg["db"]):
+        raise ValueError("EDC instance config must include host/port/user/password/db")
+
+    connect_timeout = int(cfg.get("connect_timeout", 10))
+    read_timeout = int(cfg.get("read_timeout", 120))
+    write_timeout = int(cfg.get("write_timeout", 120))
+
+    ssh_enabled = _as_bool(cfg.get("ssh_enabled"))
+    if not ssh_enabled:
+        conn = pymysql.connect(
+            host=db_cfg["host"],
+            port=db_cfg["port"],
+            user=db_cfg["user"],
+            password=db_cfg["password"],
+            db=db_cfg["db"],
+            charset=db_cfg["charset"],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            write_timeout=write_timeout,
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+        return conn, None
+
+    try:
+        from sshtunnel import SSHTunnelForwarder  # type: ignore
+    except Exception as e:
+        raise ValueError(
+            "EDC instance enabled ssh tunnel, but package `sshtunnel` is not installed. "
+            "Please install with: pip install sshtunnel"
+        ) from e
+
+    ssh_host = str(cfg.get("ssh_host") or "").strip()
+    ssh_port = int(cfg.get("ssh_port", 22))
+    ssh_user = str(cfg.get("ssh_user") or "").strip()
+    if not (ssh_host and ssh_user):
+        raise ValueError("EDC ssh config must include ssh_host/ssh_port/ssh_user when ssh_enabled=true")
+
+    ssh_password = cfg.get("ssh_password")
+    ssh_pkey = cfg.get("ssh_pkey")
+    ssh_pkey_password = cfg.get("ssh_pkey_password")
+    ssh_allow_agent = _as_bool(cfg.get("ssh_allow_agent", True))
+    if isinstance(ssh_pkey, str):
+        k = ssh_pkey.strip()
+        # Common misconfiguration: putting "ssh-rsa AAAA..." public key text in ssh_pkey.
+        if k.startswith(("ssh-rsa ", "ssh-ed25519 ", "ecdsa-sha2-")):
+            raise ValueError(
+                "ssh_pkey must be a PRIVATE key file path, not a public key string. "
+                "Use ssh_pkey like C:/Users/<you>/.ssh/id_rsa, or remove ssh_pkey and rely on ssh_allow_agent=true."
+            )
+        if k and not _Path(k).exists():
+            raise ValueError(f"ssh_pkey file not found: {k}")
+    if not ssh_password and not ssh_pkey and not ssh_allow_agent:
+        raise ValueError(
+            "EDC ssh config must provide ssh_password/ssh_pkey, "
+            "or set ssh_allow_agent=true when ssh_enabled=true"
+        )
+
+    remote_host = str(cfg.get("ssh_remote_host") or db_cfg["host"])
+    remote_port = int(cfg.get("ssh_remote_port", db_cfg["port"]))
+    local_host = str(cfg.get("ssh_local_host") or "127.0.0.1")
+    local_port = int(cfg.get("ssh_local_port", 0))
+    legacy_rsa = _as_bool(cfg.get("ssh_legacy_rsa", False))
+
+    retries = int(cfg.get("ssh_connect_retries", 2))
+    if retries < 1:
+        retries = 1
+    retry_delay_ms = int(cfg.get("ssh_retry_delay_ms", 700))
+    if retry_delay_ms < 0:
+        retry_delay_ms = 0
+
+    forwarder = None
+    last_error: Exception | None = None
+    for i in range(retries):
+        forwarder = SSHTunnelForwarder(
+            (ssh_host, ssh_port),
+            ssh_username=ssh_user,
+            ssh_password=ssh_password,
+            ssh_pkey=ssh_pkey,
+            ssh_private_key_password=ssh_pkey_password,
+            allow_agent=ssh_allow_agent,
+            remote_bind_address=(remote_host, remote_port),
+            local_bind_address=(local_host, local_port),
+            set_keepalive=30.0,
+        )
+        try:
+            if legacy_rsa:
+                # For old SSH servers (e.g. OpenSSH_6.x), prefer legacy ssh-rsa
+                # to avoid RSA SHA2 signature incompatibility.
+                orig_pubkeys = tuple(getattr(paramiko.Transport, "_preferred_pubkeys", ()))
+                try:
+                    pref = list(orig_pubkeys) if orig_pubkeys else []
+                    pref = [x for x in pref if x != "ssh-rsa"]
+                    paramiko.Transport._preferred_pubkeys = tuple(["ssh-rsa"] + pref)
+                    forwarder.start()
+                finally:
+                    if orig_pubkeys:
+                        paramiko.Transport._preferred_pubkeys = orig_pubkeys
+            else:
+                forwarder.start()
+            last_error = None
+            break
+        except Exception as e:
+            last_error = e
+            try:
+                forwarder.stop()
+            except Exception:
+                pass
+            if i < retries - 1 and retry_delay_ms > 0:
+                time.sleep(retry_delay_ms / 1000.0)
+
+    if last_error is not None:
+        auth_mode = "password" if ssh_password else ("private-key-file" if ssh_pkey else ("ssh-agent/default-key" if ssh_allow_agent else "none"))
+        raise ValueError(
+            f"SSH gateway connection failed after {retries} attempt(s): {ssh_user}@{ssh_host}:{ssh_port} (auth={auth_mode}). "
+            f"Please verify network reachability, SSH credentials, and server auth policy. detail={last_error}"
+        ) from last_error
+
+    conn = pymysql.connect(
+        host=forwarder.local_bind_host or local_host,
+        port=int(forwarder.local_bind_port),
+        user=db_cfg["user"],
+        password=db_cfg["password"],
+        db=db_cfg["db"],
+        charset=db_cfg["charset"],
+        connect_timeout=connect_timeout,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
+    return conn, forwarder
 
 
 def _render_template(template: str, params: Dict[str, Any], window_label: str, end_date: str | None) -> str:
     province = params.get("province", "province")
     cp = params.get("cp", "cp")
     direction = params.get("direction", "both")
+    edc_name = params.get("edc_name", "edc")
+    source = params.get("data_source_type", "nfa")
+    instance = params.get("data_source_instance", "default")
     context = {
         "province": province,
         "cp": cp,
         "direction": direction,
+        "edc": edc_name,
+        "source": source,
+        "instance": instance,
         "window": window_label,
         "date": end_date or "",
     }
@@ -34,16 +196,282 @@ def _render_template(template: str, params: Dict[str, Any], window_label: str, e
 def _build_base_filename(params: Dict[str, Any], window_label: str, output_filename_template: str | None, end_date: str | None) -> str:
     if output_filename_template:
         return _render_template(output_filename_template, params, window_label, end_date)
+    source = str(params.get("data_source_type") or "nfa").lower()
+    if source == "edc":
+        edc_name = params.get("edc_name", "edc")
+        instance = params.get("data_source_instance", "default")
+        return f"{edc_name}-{instance}-{window_label}"
     province = params.get("province", "province")
     cp = params.get("cp", "cp")
     direction = params.get("direction", "both")
     return f"{province}-{cp}-{direction}-{window_label}"
 
 
+def _normalize_source_type(source_type: str | None) -> str:
+    s = (source_type or "nfa").strip().lower()
+    return s if s in {"nfa", "edc"} else "nfa"
+
+
+def _load_source_config(source_type: str, instance: str | None, params: Dict[str, Any]) -> Dict[str, Any] | None:
+    inst = (instance or "default").strip() or "default"
+    cfg = params.get("db_config")
+    if isinstance(cfg, dict):
+        return cfg
+    instances = get_data_source_instances(source_type)
+    if inst in instances:
+        return instances[inst]
+    if inst == "default" and len(instances) == 1:
+        return list(instances.values())[0]
+    return None
+
+
+def _safe_identifier(name: str, field_name: str) -> str:
+    if not isinstance(name, str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
+        raise ValueError(f"invalid SQL identifier for {field_name}")
+    return name
+
+
+def _edc_like_pattern(edc_name: str, wildcard_mode: str) -> tuple[str, str]:
+    if "*" in edc_name or "?" in edc_name:
+        # glob-like wildcards:
+        # * => any length, ? => single character
+        return edc_name.replace("*", "%").replace("?", "_"), "LIKE"
+    wm = (wildcard_mode or "prefix").lower()
+    if wm == "exact":
+        return edc_name, "="
+    return f"{edc_name}%", "LIKE"
+
+
+def _query_edc_window(
+    conn,
+    table_name: str,
+    time_col: str,
+    name_col: str,
+    value_col: str,
+    edc_name: str,
+    start_s: str,
+    end_s: str,
+    wildcard_mode: str,
+    exclude_like: str | None,
+) -> list[dict]:
+    pattern, op = _edc_like_pattern(edc_name, wildcard_mode)
+    where = [f"{name_col} {op} %s", f"{time_col} >= %s", f"{time_col} <= %s"]
+    args: list[Any] = [pattern, start_s, end_s]
+    if exclude_like:
+        where.append(f"{name_col} NOT LIKE %s")
+        args.append(exclude_like)
+    sql = f"""
+        SELECT {time_col} AS create_time, SUM({value_col}) AS total_service_size
+        FROM {table_name}
+        WHERE {" AND ".join(where)}
+        GROUP BY {time_col}
+        ORDER BY {time_col}
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(sql, tuple(args))
+        return list(cursor.fetchall() or [])
+
+
+def _pick_daily_95_from_rows(rows: list[dict], rank_index: int) -> tuple[float, int]:
+    if not rows:
+        return 0.0, 0
+    vals = sorted((float(r.get("total_service_size") or 0.0) for r in rows), reverse=True)
+    idx = min(max(0, rank_index), len(vals) - 1)
+    return vals[idx], len(vals)
+
+
+def _compute_edc_and_export(
+    job_id: str,
+    resolved_window: Dict[str, Any],
+    params: Dict[str, Any],
+    export_formats: List[str],
+    output_filename_template: str | None,
+    total_days: int,
+    progress_cb: Callable[[int, str], None] | None = None,
+) -> List[Dict[str, Any]]:
+    start_time = resolved_window["start_time"]
+    end_time = resolved_window["end_time"]
+    window_label = resolved_window.get("label") or f"{start_time.split(' ')[0]}-{end_time.split(' ')[0]}"
+    end_date = (end_time.split(' ')[0] if isinstance(end_time, str) and ' ' in end_time else str(end_time))
+    base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
+    sortby = params.get("sortby")
+    sort_order = params.get("sort_order", "desc")
+
+    edc_name = str(params.get("edc_name") or "").strip()
+    if not edc_name:
+        raise ValueError("edc_name is required in params when data_source_type=edc")
+
+    source_instance = str(params.get("data_source_instance") or "default")
+    cfg = _load_source_config("edc", source_instance, params)
+    if not cfg:
+        raise ValueError(f"EDC data source instance not found: {source_instance}")
+
+    table_name = _safe_identifier(str(cfg.get("table", "edc_data")), "table")
+    time_col = _safe_identifier(str(cfg.get("time_column", "create_time")), "time_column")
+    name_col = _safe_identifier(str(cfg.get("name_column", "edc_name")), "name_column")
+    value_col = _safe_identifier(str(cfg.get("value_column", "service_size")), "value_column")
+    wildcard_mode = str(cfg.get("wildcard_mode", "prefix"))
+    if params.get("edc_match_mode"):
+        wildcard_mode = str(params.get("edc_match_mode"))
+    exclude_like = cfg.get("exclude_like", "%-backup")
+    if "edc_exclude_like" in params:
+        exclude_like = params.get("edc_exclude_like")
+    rank_index = int(params.get("edc_rank_index", cfg.get("daily_rank_index", 14)))
+    export_daily = bool(params.get("export_daily", False))
+    settlement_mode = str(params.get("settlement_mode") or "range_95")
+    unit_base = int(params.get("unit_base", 1024))
+    if unit_base not in (1000, 1024):
+        unit_base = 1024
+
+    _progress(progress_cb, 6, "EDC: 正在建立数据库连接")
+    conn, tunnel = _connect_edc_db(cfg)
+    try:
+        _progress(progress_cb, 8, "EDC: 已连接数据源，开始按天计算")
+        st = pd.to_datetime(start_time)
+        et = pd.to_datetime(end_time)
+        daily_rows: List[Dict[str, Any]] = []
+        cur = st.normalize()
+        while cur <= et.normalize():
+            day_start = max(st, cur)
+            day_end = min(et, cur + timedelta(days=1) - timedelta(seconds=1))
+            rows = _query_edc_window(
+                conn, table_name, time_col, name_col, value_col, edc_name,
+                f"{day_start:%Y-%m-%d %H:%M:%S}", f"{day_end:%Y-%m-%d %H:%M:%S}",
+                wildcard_mode, exclude_like,
+            )
+            raw95, points = _pick_daily_95_from_rows(rows, rank_index)
+            daily_rows.append({
+                "date": f"{cur:%Y-%m-%d}",
+                "edc_name": edc_name,
+                "data_source_instance": source_instance,
+                "daily_95th_percentile_raw": raw95,
+                "daily_95th_percentile_mbps": float(raw95) * 8.0 / 60.0 / float(unit_base) / float(unit_base),
+                "data_points_daily": points,
+            })
+            done_days = len(daily_rows)
+            total_days_span = max(1, int((et.normalize() - st.normalize()).days + 1))
+            pct = 8 + int(done_days * 72 / total_days_span)
+            _progress(progress_cb, pct, f"EDC: 按天计算进度 {done_days}/{total_days_span}")
+            cur += timedelta(days=1)
+
+        # Prepare raw settlement baselines for optional budget summary.
+        daily_avg_raw = 0.0
+        if daily_rows:
+            daily_avg_raw = float(pd.Series([float(r.get("daily_95th_percentile_raw") or 0.0) for r in daily_rows]).sum()) / float(total_days)
+        full_rows = _query_edc_window(
+            conn, table_name, time_col, name_col, value_col, edc_name,
+            f"{st:%Y-%m-%d %H:%M:%S}", f"{et:%Y-%m-%d %H:%M:%S}",
+            wildcard_mode, exclude_like,
+        )
+        range_raw, _range_points = _pick_daily_95_from_rows(full_rows, rank_index)
+
+        # Optional "data budget" summary: convert raw settlement by custom formula.
+        if bool(params.get("data_budget_enabled", False)):
+            try:
+                mul = float(params.get("data_budget_mul", 8))
+            except Exception:
+                mul = 8.0
+            try:
+                div = float(params.get("data_budget_div", 300))
+            except Exception:
+                div = 300.0
+            if div == 0:
+                div = 300.0
+            ym = f"{et:%Y-%m}"
+
+            def _step1(raw_v: float) -> float:
+                return float(raw_v) * float(mul) / float(div)
+
+            def _conv(step1_v: float, base: int) -> float:
+                return float(step1_v) / float(base) / float(base)
+
+            daily_step1 = _step1(daily_avg_raw)
+            range_step1 = _step1(range_raw)
+
+            effective_pattern, match_op = _edc_like_pattern(edc_name, wildcard_mode)
+            budget_summary = {
+                "year_month": ym,
+                "formula": f"raw*{mul:g}/{div:g}/base/base",
+                "source_table": table_name,
+                "source_time_column": time_col,
+                "source_name_column": name_col,
+                "source_value_column": value_col,
+                "match_mode": wildcard_mode,
+                "match_operator": match_op,
+                "effective_pattern": effective_pattern,
+                "exclude_like": exclude_like,
+                "raw_daily_95_avg": float(daily_avg_raw),
+                "raw_range_95": float(range_raw),
+                "raw_daily_95_avg_step1": float(daily_step1),
+                "raw_range_95_step1": float(range_step1),
+                "daily_95_avg_1000": _conv(daily_step1, 1000),
+                "range_95_1000": _conv(range_step1, 1000),
+                "daily_95_avg_1024": _conv(daily_step1, 1024),
+                "range_95_1024": _conv(range_step1, 1024),
+                "daily_days": int(len(daily_rows)),
+                "range_points": int(_range_points),
+                "updated_at": datetime.utcnow().isoformat(timespec="seconds"),
+            }
+            try:
+                summary_path = get_job_dir(job_id) / "budget_summary.json"
+                summary_path.write_text(json.dumps(budget_summary, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
+        if export_daily:
+            df = pd.DataFrame(daily_rows)
+            if sortby and sortby in df.columns:
+                df = df.sort_values(by=sortby, ascending=(sort_order == "asc"))
+            _progress(progress_cb, 92, "EDC: 正在导出产物")
+            return _export_df(df, job_id, base_name, export_formats)
+
+        if settlement_mode == "daily_95_avg":
+            daily_series = pd.Series([float(r["daily_95th_percentile_mbps"]) for r in daily_rows])
+            value_mbps = float(daily_series.sum()) / float(total_days) if not daily_series.empty else 0.0
+            value_raw = value_mbps * 60.0 * float(unit_base) * float(unit_base) / 8.0
+        else:
+            value_raw, points = _pick_daily_95_from_rows(full_rows, rank_index)
+            value_mbps = float(value_raw) * 8.0 / 60.0 / float(unit_base) / float(unit_base)
+
+        if settlement_mode == "daily_95_avg":
+            points = len(daily_rows)
+        df = pd.DataFrame([{
+            "edc_name": edc_name,
+            "data_source_instance": source_instance,
+            "95th_percentile_raw": float(value_raw),
+            "95th_percentile_mbps": float(value_mbps),
+            "settlement_mode": settlement_mode,
+            "data_points": int(points),
+        }])
+        if sortby and sortby in df.columns:
+            df = df.sort_values(by=sortby, ascending=(sort_order == "asc"))
+        _progress(progress_cb, 92, "EDC: 正在导出产物")
+        return _export_df(df, job_id, base_name, export_formats)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            if tunnel is not None:
+                tunnel.stop()
+        except Exception:
+            pass
+
+
 def _to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     if not results:
         return pd.DataFrame()
     return pd.DataFrame(results)
+
+
+def _progress(progress_cb: Callable[[int, str], None] | None, pct: int, stage: str) -> None:
+    if not progress_cb:
+        return
+    try:
+        progress_cb(max(0, min(100, int(pct))), str(stage))
+    except Exception:
+        pass
 
 
 def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_formats: List[str]) -> List[Dict[str, Any]]:
@@ -75,13 +503,18 @@ def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_format
     return artifacts
 
 
-def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dict[str, Any], export_formats: List[str] | None, output_filename_template: str | None) -> List[Dict[str, Any]]:
+def compute_and_export(
+    job_id: str,
+    resolved_window: Dict[str, Any],
+    params: Dict[str, Any],
+    export_formats: List[str] | None,
+    output_filename_template: str | None,
+    progress_cb: Callable[[int, str], None] | None = None,
+) -> List[Dict[str, Any]]:
     """Run 95th percentile computation using the existing script functions and export artifacts.
 
     params accepts the same keys as the original CLI script, except start/end time which come from resolved_window.
     """
-    settings = get_settings()
-
     export_formats = export_formats or ["csv"]
 
     # Resolve times
@@ -96,6 +529,14 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
         total_days = max(1, (_ed - _sd).days + 1)
     except Exception:
         total_days = 1
+
+    source_type = _normalize_source_type(params.get("data_source_type"))
+    source_instance = str(params.get("data_source_instance") or "default")
+    params["data_source_type"] = source_type
+    params["data_source_instance"] = source_instance
+    _progress(progress_cb, 3, f"初始化: 数据源 {source_type}/{source_instance}")
+    if source_type == "edc":
+        return _compute_edc_and_export(job_id, resolved_window, params, export_formats, output_filename_template, total_days, progress_cb)
 
     # Required params
     province = params.get("province")
@@ -125,18 +566,19 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
     merge_key = params.get("merge_key")
     monthly_aggregate = bool(params.get("monthly_aggregate", False))
 
-    # Prefer env MySQL settings; fallback to db_config.ini if provided in params
+    # Prefer selected NFA instance config; fallback to db_config.ini if provided in params
     db_cfg = None
-    if settings.MYSQL_HOST and settings.MYSQL_USER and settings.MYSQL_PASSWORD and settings.MYSQL_DB:
+    selected_cfg = _load_source_config("nfa", source_instance, params)
+    if selected_cfg:
         db_cfg = {
-            'host': settings.MYSQL_HOST,
-            'port': settings.MYSQL_PORT or 3306,
-            'user': settings.MYSQL_USER,
-            'password': settings.MYSQL_PASSWORD,
-            'db': settings.MYSQL_DB,
-            'charset': settings.MYSQL_CHARSET or 'utf8mb4',
+            'host': selected_cfg.get('host'),
+            'port': int(selected_cfg.get('port', 3306)),
+            'user': selected_cfg.get('user'),
+            'password': selected_cfg.get('password'),
+            'db': selected_cfg.get('db'),
+            'charset': selected_cfg.get('charset', 'utf8mb4'),
         }
-    else:
+    if not db_cfg:
         # use ini path relative to server/ directory
         ini_arg = params.get("config") or "db_config.ini"
         base_dir = Path(__file__).resolve().parents[1]  # server/
@@ -149,6 +591,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
 
     artifacts: List[Dict[str, Any]] = []
     try:
+        _progress(progress_cb, 8, "NFA: 已连接数据源，加载匹配对象")
         schools = c95.get_schools_by_province_and_cp(conn, province, cp, school)
         if not schools:
             # 无数据时输出一份说明文件
@@ -184,9 +627,12 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
             base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
             rows_all: list[dict] = []
 
-            for rg in _month_ranges(start_time, end_time):
+            month_ranges = _month_ranges(start_time, end_time)
+            total_months = max(1, len(month_ranges))
+            for i, rg in enumerate(month_ranges, start=1):
                 st = pd.to_datetime(rg['start'])
                 et = pd.to_datetime(rg['end'])
+                _progress(progress_cb, 12 + int(i * 68 / total_months), f"NFA: 按月聚合 {rg['label']} ({i}/{total_months})")
 
                 if aggregate_all:
                     if settlement_mode == 'daily_95_avg':
@@ -240,6 +686,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     sort_keys.append(name_col)
                 if sort_keys:
                     dfm = dfm.sort_values(by=sort_keys, kind='stable')
+            _progress(progress_cb, 92, "NFA: 正在导出按月产物")
             artifacts += _export_df(dfm, job_id, f"{base_name}-monthly", export_formats)
             return artifacts
 
@@ -284,6 +731,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                 # 排序
                 if sortby and sortby in df_excluded.columns:
                     df_excluded = df_excluded.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                _progress(progress_cb, 76, "NFA: 正在导出排除组产物")
                 artifacts += _export_df(df_excluded, job_id, f"{base_name}_excluded", export_formats)
 
             # 2) 剩余组（整体汇总）
@@ -388,6 +836,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     # 排序
                     if sortby and sortby in df_remaining.columns:
                         df_remaining = df_remaining.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                    _progress(progress_cb, 90, "NFA: 正在导出剩余组产物")
                     artifacts += _export_df(df_remaining, job_id, f"{base_name}_remaining", export_formats)
             return artifacts
         else:
@@ -426,6 +875,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     df = _to_dataframe(rows)
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                _progress(progress_cb, 92, "NFA: 正在导出产物")
                 artifacts += _export_df(df, job_id, base_name, export_formats)
                 return artifacts
             else:
@@ -473,6 +923,7 @@ def compute_and_export(job_id: str, resolved_window: Dict[str, Any], params: Dic
                     df = _to_dataframe(rows)
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
+                _progress(progress_cb, 92, "NFA: 正在导出产物")
                 artifacts += _export_df(df, job_id, base_name, export_formats)
                 return artifacts
     finally:
