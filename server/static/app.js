@@ -435,7 +435,7 @@ createApp({
         p.aggregate_all = false
         p.combine_v4_v6 = false
         p.merge_key = ''
-        p.monthly_aggregate = false
+        if (typeof p.monthly_aggregate !== 'boolean') p.monthly_aggregate = false
         delete p.province
         delete p.cp
         delete p.school

@@ -319,6 +319,7 @@ def _compute_edc_and_export(
         exclude_like = params.get("edc_exclude_like")
     rank_index = int(params.get("edc_rank_index", cfg.get("daily_rank_index", 14)))
     export_daily = bool(params.get("export_daily", False))
+    monthly_aggregate = bool(params.get("monthly_aggregate", False))
     settlement_mode = str(params.get("settlement_mode") or "range_95")
     unit_base = int(params.get("unit_base", 1024))
     if unit_base not in (1000, 1024):
@@ -420,6 +421,65 @@ def _compute_edc_and_export(
                 summary_path.write_text(json.dumps(budget_summary, ensure_ascii=False), encoding="utf-8")
             except Exception:
                 pass
+
+        if monthly_aggregate:
+            def _month_ranges(start_s: str, end_s: str) -> list[dict]:
+                s = pd.to_datetime(start_s)
+                e = pd.to_datetime(end_s)
+                cur = pd.Timestamp(year=s.year, month=s.month, day=1)
+                out: list[dict] = []
+                while cur <= e:
+                    if cur.month == 12:
+                        next_first = pd.Timestamp(year=cur.year + 1, month=1, day=1)
+                    else:
+                        next_first = pd.Timestamp(year=cur.year, month=cur.month + 1, day=1)
+                    seg_start = max(cur, s)
+                    seg_end = min(next_first - pd.Timedelta(seconds=1), e)
+                    out.append({
+                        "label": f"{cur.year}-{cur.month:02d}",
+                        "start": f"{seg_start:%Y-%m-%d %H:%M:%S}",
+                        "end": f"{seg_end:%Y-%m-%d %H:%M:%S}",
+                    })
+                    cur = next_first
+                return out
+
+            rows_all: list[dict] = []
+            month_ranges = _month_ranges(start_time, end_time)
+            total_months = max(1, len(month_ranges))
+            for i, rg in enumerate(month_ranges, start=1):
+                _progress(progress_cb, 80 + int(i * 10 / total_months), f"EDC: 按月聚合 {rg['label']} ({i}/{total_months})")
+                month_daily = [r for r in daily_rows if str(r.get("date", "")).startswith(rg["label"])]
+                if settlement_mode == "daily_95_avg":
+                    if month_daily:
+                        month_mbps = float(pd.Series([float(x.get("daily_95th_percentile_mbps") or 0.0) for x in month_daily]).sum()) / float(len(month_daily))
+                    else:
+                        month_mbps = 0.0
+                    month_raw = mbps_to_raw(float(month_mbps), unit_base, edc_divisor)
+                    points = len(month_daily)
+                else:
+                    month_full_rows = _query_edc_window(
+                        conn, table_name, time_col, name_col, value_col, edc_name,
+                        rg["start"], rg["end"], wildcard_mode, exclude_like
+                    )
+                    month_raw, points = _pick_daily_95_from_rows(month_full_rows, rank_index)
+                    month_mbps = raw_to_mbps(float(month_raw), unit_base, edc_divisor)
+                rows_all.append({
+                    "month": rg["label"],
+                    "edc_name": edc_name,
+                    "data_source_instance": source_instance,
+                    "95th_percentile_raw": float(month_raw),
+                    "95th_percentile_mbps": float(month_mbps),
+                    "settlement_mode": settlement_mode,
+                    "data_points": int(points),
+                })
+
+            dfm = pd.DataFrame(rows_all)
+            if sortby and sortby in dfm.columns:
+                dfm = dfm.sort_values(by=sortby, ascending=(sort_order == "asc"))
+            elif "month" in dfm.columns:
+                dfm = dfm.sort_values(by="month", ascending=True, kind="stable")
+            _progress(progress_cb, 92, "EDC: 正在导出按月产物")
+            return _export_df(dfm, job_id, f"{base_name}-monthly", export_formats)
 
         if export_daily:
             df = pd.DataFrame(daily_rows)
