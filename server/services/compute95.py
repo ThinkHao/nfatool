@@ -18,6 +18,7 @@ from ..ext import calculate_95th_percentile as c95
 from ..config import get_data_source_instances
 from .exporter import export_csv, export_xlsx
 from .storage import get_job_dir, safe_artifact_path
+from .unit_conversion import mbps_to_raw, raw_to_mbps
 
 
 def _as_bool(v: Any) -> bool:
@@ -322,6 +323,8 @@ def _compute_edc_and_export(
     unit_base = int(params.get("unit_base", 1024))
     if unit_base not in (1000, 1024):
         unit_base = 1024
+    # EDC 5-minute points: raw -> Mbps uses *8/300 (NFA keeps *8/60 in its own branch).
+    edc_divisor = 300.0
 
     _progress(progress_cb, 6, "EDC: 正在建立数据库连接")
     conn, tunnel = _connect_edc_db(cfg)
@@ -345,7 +348,7 @@ def _compute_edc_and_export(
                 "edc_name": edc_name,
                 "data_source_instance": source_instance,
                 "daily_95th_percentile_raw": raw95,
-                "daily_95th_percentile_mbps": float(raw95) * 8.0 / 60.0 / float(unit_base) / float(unit_base),
+                "daily_95th_percentile_mbps": raw_to_mbps(float(raw95), unit_base, edc_divisor),
                 "data_points_daily": points,
             })
             done_days = len(daily_rows)
@@ -428,10 +431,10 @@ def _compute_edc_and_export(
         if settlement_mode == "daily_95_avg":
             daily_series = pd.Series([float(r["daily_95th_percentile_mbps"]) for r in daily_rows])
             value_mbps = float(daily_series.sum()) / float(total_days) if not daily_series.empty else 0.0
-            value_raw = value_mbps * 60.0 * float(unit_base) * float(unit_base) / 8.0
+            value_raw = mbps_to_raw(float(value_mbps), unit_base, edc_divisor)
         else:
             value_raw, points = _pick_daily_95_from_rows(full_rows, rank_index)
-            value_mbps = float(value_raw) * 8.0 / 60.0 / float(unit_base) / float(unit_base)
+            value_mbps = raw_to_mbps(float(value_raw), unit_base, edc_divisor)
 
         if settlement_mode == "daily_95_avg":
             points = len(daily_rows)
