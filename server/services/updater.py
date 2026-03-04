@@ -5,7 +5,7 @@ import os
 import platform
 import re
 import ssl
-import tempfile
+import subprocess
 import threading
 import urllib.request
 from pathlib import Path
@@ -93,6 +93,76 @@ def _download_file(url: str, dst: Path) -> None:
             f.write(chunk)
 
 
+def _resolve_runner_log(settings, target: Path) -> Path:
+    raw = str(settings.UPDATE_RUNNER_LOG or "").strip()
+    if raw:
+        p = Path(raw)
+        if not p.is_absolute():
+            p = target.parent / p
+        return p
+    return target.parent / "logs" / "update-runner.log"
+
+
+def _apply_update_external(info: dict[str, Any], restart_after_update: bool) -> dict[str, Any]:
+    s = get_settings()
+    script_raw = str(s.UPDATE_EXTERNAL_SCRIPT or "").strip()
+    if not script_raw:
+        raise ValueError("external updater script is not configured")
+    script = Path(script_raw)
+    if not script.exists():
+        raise ValueError(f"external updater script not found: {script}")
+
+    target = Path(os.path.realpath(os.sys.executable))
+    if not target.exists():
+        raise ValueError("executable path not found")
+
+    latest_version = str(info.get("latest_version") or "").strip() or "latest"
+    asset_url = str(info.get("asset_url") or "").strip()
+    if not asset_url:
+        raise ValueError(f"release asset not found: {info.get('asset_name')}")
+
+    cmd = [
+        str(script),
+        "--asset-url", asset_url,
+        "--version", latest_version,
+        "--target", str(target),
+        "--service", str(s.UPDATE_SERVICE_NAME or "nfa95.service"),
+        "--health-url", str(s.UPDATE_HEALTHCHECK_URL or "http://127.0.0.1:8000/api/health"),
+        "--health-timeout", str(int(s.UPDATE_HEALTHCHECK_TIMEOUT_SEC or 45)),
+    ]
+    if s.UPDATE_CA_BUNDLE:
+        cmd.extend(["--ca-bundle", str(s.UPDATE_CA_BUNDLE)])
+    if bool(s.UPDATE_SKIP_TLS_VERIFY):
+        cmd.append("--insecure")
+    if not restart_after_update:
+        cmd.append("--no-restart")
+
+    log_path = _resolve_runner_log(s, target)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as lf:
+        lf.write(f"\n[updater] trigger external update: version={latest_version}, target={target}\n")
+        lf.flush()
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=lf,
+            stderr=lf,
+            start_new_session=True,
+            cwd=str(target.parent),
+        )
+
+    return {
+        "ok": True,
+        "updated": True,
+        "restarted": bool(restart_after_update),
+        "mode": "external-script",
+        "runner_script": str(script),
+        "runner_log": str(log_path),
+        "message": "update started by external runner",
+        **info,
+    }
+
+
 def _ssl_context() -> ssl.SSLContext:
     s = get_settings()
     if bool(s.UPDATE_SKIP_TLS_VERIFY):
@@ -118,27 +188,41 @@ def apply_update(restart_after_update: bool = True) -> dict[str, Any]:
         raise ValueError(str(info.get("message") or "update check failed"))
     if not info.get("update_available"):
         return {"ok": True, "updated": False, "message": "already latest", **info}
+
+    s = get_settings()
+    if platform.system().lower().startswith("linux") and str(s.UPDATE_EXTERNAL_SCRIPT or "").strip():
+        return _apply_update_external(info, restart_after_update)
+
+    # Only support self-update for packaged executable.
     url = str(info.get("asset_url") or "").strip()
     if not url:
         raise ValueError(f"release asset not found: {info.get('asset_name')}")
-
-    # Only support self-update for packaged executable.
     target = Path(os.path.realpath(os.sys.executable))
     if not target.exists():
         raise ValueError("executable path not found")
 
-    tmp_dir = Path(tempfile.gettempdir())
-    tmp_file = tmp_dir / f"{target.name}.download"
+    # Download to the same directory as target to avoid cross-device rename issues.
+    tmp_file = target.parent / f".{target.name}.download"
     bak_file = target.with_suffix(target.suffix + ".bak")
     _download_file(url, tmp_file)
     os.chmod(tmp_file, 0o755)
-    # keep a backup and atomically replace
+    # Keep a backup and atomically replace with rollback on failure.
+    moved_to_backup = False
     try:
         if target.exists():
             if bak_file.exists():
                 bak_file.unlink(missing_ok=True)
             os.replace(target, bak_file)
-        os.replace(tmp_file, target)
+            moved_to_backup = True
+        try:
+            os.replace(tmp_file, target)
+        except Exception as e:
+            if moved_to_backup and bak_file.exists() and not target.exists():
+                try:
+                    os.replace(bak_file, target)
+                except Exception:
+                    pass
+            raise ValueError(f"failed to replace executable: {e}") from e
     finally:
         if tmp_file.exists():
             tmp_file.unlink(missing_ok=True)

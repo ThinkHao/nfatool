@@ -64,6 +64,11 @@ class Settings(BaseSettings):
     UPDATE_ASSET_WINDOWS: str = "nfa95.exe"
     UPDATE_CA_BUNDLE: Optional[str] = None  # custom CA bundle path for updater HTTPS
     UPDATE_SKIP_TLS_VERIFY: bool = False    # unsafe, only for temporary troubleshooting
+    UPDATE_EXTERNAL_SCRIPT: Optional[str] = None  # linux external updater script path
+    UPDATE_SERVICE_NAME: str = "nfa95.service"
+    UPDATE_HEALTHCHECK_URL: str = "http://127.0.0.1:8000/api/health"
+    UPDATE_HEALTHCHECK_TIMEOUT_SEC: int = 45
+    UPDATE_RUNNER_LOG: Optional[str] = None
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", case_sensitive=False)
 

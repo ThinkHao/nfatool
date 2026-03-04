@@ -99,6 +99,19 @@ MYSQL_DB=database
 - 停止旧版本进程。
 - 只需用新版本 `nfa95.exe` 替换原文件；`.env`、`logs/`、`storage/` 可保留。
 
+Linux 生产环境建议使用“外部升级脚本”模式（更稳健，支持失败回滚）：
+
+1. 将 `server/scripts/nfa95-update.sh` 部署到服务器，例如 `/home/nfa95/bin/nfa95-update.sh`，并授予执行权限。
+2. 在 `.env` 配置：
+```
+UPDATE_EXTERNAL_SCRIPT=/home/nfa95/bin/nfa95-update.sh
+UPDATE_SERVICE_NAME=nfa95.service
+UPDATE_HEALTHCHECK_URL=http://127.0.0.1:8000/api/health
+UPDATE_HEALTHCHECK_TIMEOUT_SEC=45
+UPDATE_RUNNER_LOG=/home/nfa95/logs/update-runner.log
+```
+3. Web 点击“一键升级”后，后端会触发外部脚本执行两阶段切换与健康检查；失败将自动回滚并重启旧版本。
+
 备注：
 
 - 前端静态文件和 `mapping.json` 会随可执行文件一同打包；若需要覆盖，可将 `mapping.json` 放在 exe 同级目录。
