@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     GITHUB_REPO: Optional[str] = None  # owner/repo
     UPDATE_ASSET_LINUX: str = "nfa95"
     UPDATE_ASSET_WINDOWS: str = "nfa95.exe"
+    UPDATE_CA_BUNDLE: Optional[str] = None  # custom CA bundle path for updater HTTPS
+    UPDATE_SKIP_TLS_VERIFY: bool = False    # unsafe, only for temporary troubleshooting
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", case_sensitive=False)
 

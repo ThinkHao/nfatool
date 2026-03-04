@@ -4,6 +4,7 @@ import json
 import os
 import platform
 import re
+import ssl
 import tempfile
 import threading
 import urllib.request
@@ -28,6 +29,7 @@ def _is_newer(latest: str, current: str) -> bool:
 
 
 def _github_json(url: str) -> dict[str, Any]:
+    ctx = _ssl_context()
     req = urllib.request.Request(
         url,
         headers={
@@ -35,7 +37,7 @@ def _github_json(url: str) -> dict[str, Any]:
             "User-Agent": "nfa95-updater",
         },
     )
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
         raw = resp.read().decode("utf-8", errors="ignore")
         obj = json.loads(raw)
         return obj if isinstance(obj, dict) else {}
@@ -54,7 +56,13 @@ def check_update() -> dict[str, Any]:
     repo = str(s.GITHUB_REPO or "").strip()
     if not repo:
         return {"ok": False, "message": "GITHUB_REPO is not configured", "current_version": current}
-    data = _github_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    try:
+        data = _github_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    except Exception as e:
+        msg = str(e)
+        if "CERTIFICATE_VERIFY_FAILED" in msg or "certificate verify failed" in msg.lower():
+            msg += " | hint: configure UPDATE_CA_BUNDLE or install CA certificates (temporary workaround: UPDATE_SKIP_TLS_VERIFY=true)"
+        return {"ok": False, "repo": repo, "current_version": current, "message": msg}
     tag = str(data.get("tag_name") or "").strip()
     assets = data.get("assets") or []
     if not isinstance(assets, list):
@@ -75,13 +83,33 @@ def check_update() -> dict[str, Any]:
 
 
 def _download_file(url: str, dst: Path) -> None:
+    ctx = _ssl_context()
     req = urllib.request.Request(url, headers={"User-Agent": "nfa95-updater"})
-    with urllib.request.urlopen(req, timeout=30) as resp, dst.open("wb") as f:
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp, dst.open("wb") as f:
         while True:
             chunk = resp.read(1024 * 1024)
             if not chunk:
                 break
             f.write(chunk)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    s = get_settings()
+    if bool(s.UPDATE_SKIP_TLS_VERIFY):
+        return ssl._create_unverified_context()
+    # 1) custom CA bundle from env
+    if s.UPDATE_CA_BUNDLE:
+        p = Path(str(s.UPDATE_CA_BUNDLE))
+        if p.exists():
+            return ssl.create_default_context(cafile=str(p))
+    # 2) certifi bundle (works well on minimal Linux distros)
+    try:
+        import certifi  # type: ignore
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    # 3) system default CA store
+    return ssl.create_default_context()
 
 
 def apply_update(restart_after_update: bool = True) -> dict[str, Any]:
