@@ -1,0 +1,3 @@
+interface:
+  display_name: "Traffic 95 Core"
+  short_description: "Run fixed EDC/NFA 95th compute and export workflows"

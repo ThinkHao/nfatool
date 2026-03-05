@@ -1,0 +1,3 @@
+interface:
+  display_name: "Traffic 95 Platform"
+  short_description: "Integrate and govern NFA/EDC 95th compute, export, and release workflow"

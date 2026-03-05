@@ -1,0 +1,3 @@
+interface:
+  display_name: "Traffic 95 Nfatool Adapter"
+  short_description: "Map core EDC/NFA workflow to nfatool APIs and task schema"
