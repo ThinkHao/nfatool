@@ -82,6 +82,9 @@ def create_default_config(config_file):
 def connect_to_db(db_config):
     """连接到数据库"""
     try:
+        connect_timeout = int(db_config.get('connect_timeout', 10))
+        read_timeout = int(db_config.get('read_timeout', 120))
+        write_timeout = int(db_config.get('write_timeout', 120))
         connection = pymysql.connect(
             host=db_config['host'],
             port=db_config['port'],
@@ -89,6 +92,9 @@ def connect_to_db(db_config):
             password=db_config['password'],
             db=db_config['db'],
             charset=db_config['charset'],
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            write_timeout=write_timeout,
             cursorclass=pymysql.cursors.DictCursor
         )
         return connection
@@ -269,6 +275,38 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
     df_all = pd.concat(frames, ignore_index=True)
     df_all['create_time'] = pd.to_datetime(df_all['create_time'])
     return df_all
+
+
+def filter_pairs_with_data(connection, pairs, start_time, end_time, batch_size=300):
+    """返回在时间窗口内至少有一条流量数据的 (ipgroup_id, nfa_uuid) 集合。
+    查询失败时返回 None（调用方可回退到原路径）。
+    """
+    if not pairs:
+        return set()
+    matched = set()
+    total = len(pairs)
+    for i in range(0, total, batch_size):
+        chunk = pairs[i:i + batch_size]
+        placeholders = ", ".join(["(%s, %s)"] * len(chunk))
+        sql = f"""
+            SELECT DISTINCT ipgroup_id, nfa_uuid
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND (ipgroup_id, nfa_uuid) IN ({placeholders})
+        """
+        params = [start_time, end_time]
+        for ipg, uuid in chunk:
+            params.extend([ipg, uuid])
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall()
+                for r in rows or []:
+                    matched.add((r["ipgroup_id"], r["nfa_uuid"]))
+        except Exception as e:
+            logger.error(f"预筛选有数据对象失败: {e}")
+            return None
+    return matched
 
 def process_schools_batched(connection, schools, start_time, end_time, direction, export_daily, batch_size=200, unit_base: int = 1024, combine_v4_v6: bool = False, merge_key: str | None = None):
     """
@@ -830,3 +868,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -325,7 +325,7 @@ async def test_data_source_connection_api(payload: DataSourceTestPayload):
 async def create_task(payload: TaskCreate):
     with session_scope() as s:
         if s.query(Task).filter(Task.name == payload.name).first():
-            raise HTTPException(status_code=400, detail="Task name already exists")
+            raise HTTPException(status_code=400, detail={"code": "TASK_NAME_DUPLICATE", "message": "任务名称已存在，请更换后重试"})
         t = Task(
             name=payload.name,
             active=payload.active,
@@ -590,6 +590,10 @@ async def update_task(task_id: int, payload: TaskUpdate):
         if not t:
             raise HTTPException(status_code=404, detail="Task not found")
         data = payload.model_dump(exclude_unset=True)
+        if "name" in data and data["name"]:
+            dup = s.query(Task).filter(Task.name == data["name"], Task.id != task_id).first()
+            if dup:
+                raise HTTPException(status_code=400, detail={"code": "TASK_NAME_DUPLICATE", "message": "任务名称已存在，请更换后重试"})
         if "window_params" in data and data["window_params"] is not None:
             data["window_params"] = json.dumps(data["window_params"], ensure_ascii=False)
         if "params" in data and data["params"] is not None:
@@ -909,3 +913,4 @@ async def batch_download_jobs(payload: JobBatchDownload):
         for arc, p in files:
             zf.write(p, arcname=arc)
     return FileResponse(path=str(zip_path), filename=zip_name, media_type="application/zip")
+

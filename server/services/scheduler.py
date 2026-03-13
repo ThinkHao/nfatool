@@ -56,6 +56,17 @@ def _append_progress_event(run: JobRun, pct: int, stage: str) -> None:
         events.append({"time": now, "pct": int(pct), "stage": str(stage)})
         run.progress_events = json.dumps(events[-30:], ensure_ascii=False)
 
+def _extract_terminal_reason(artifacts: list[dict] | None) -> Optional[str]:
+    if not isinstance(artifacts, list):
+        return None
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        reason = item.get("terminal_reason")
+        if reason:
+            return str(reason)
+    return None
+
 
 def _ensure_scheduler():
     global scheduler
@@ -165,14 +176,16 @@ async def _execute_job(job_id: str):
             if last_err is not None:
                 raise last_err
             # Update DB
+            terminal_reason = _extract_terminal_reason(artifacts)
             with session_scope() as s:
                 run: JobRun = s.get(JobRun, job_id)
                 run.status = "succeeded"
                 run.progress_pct = 100
-                run.progress_stage = "执行完成"
-                _append_progress_event(run, 100, "执行完成")
+                run.progress_stage = "执行完成（无匹配数据）" if terminal_reason else "执行完成"
+                _append_progress_event(run, 100, run.progress_stage)
                 run.finished_at = datetime.utcnow()
                 run.artifacts = json.dumps(artifacts, ensure_ascii=False)
+                run.error_message = terminal_reason if terminal_reason else None
                 run.log_path = str(get_job_log_path(job_id))
                 s.add(run)
             # Sync optional budget summary to parent task for quick dashboard view.
@@ -191,6 +204,20 @@ async def _execute_job(job_id: str):
             except Exception:
                 pass
             logger.info("Job succeeded: %s", job_id)
+        except asyncio.CancelledError:
+            with session_scope() as s:
+                run: JobRun = s.get(JobRun, job_id)
+                if run:
+                    run.status = "failed"
+                    run.progress_pct = 100
+                    run.progress_stage = "执行中止"
+                    _append_progress_event(run, 100, "执行中止")
+                    run.finished_at = datetime.utcnow()
+                    run.error_message = "任务被取消：服务正在关闭"
+                    run.log_path = str(get_job_log_path(job_id))
+                    s.add(run)
+            logger.warning("Job cancelled during shutdown: %s", job_id)
+            return
         except Exception as e:  # noqa
             with session_scope() as s:
                 run: JobRun = s.get(JobRun, job_id)
@@ -379,3 +406,6 @@ def apply_schedule_for_task_snapshot(task_id: int, active: bool, kind: str | Non
     except Exception:
         # ignore bad schedules
         pass
+
+
+

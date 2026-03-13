@@ -367,6 +367,10 @@ def _compute_edc_and_export(
             f"{st:%Y-%m-%d %H:%M:%S}", f"{et:%Y-%m-%d %H:%M:%S}",
             wildcard_mode, exclude_like,
         )
+        if not full_rows:
+            reason = f"EDC 无匹配数据：模式={edc_name}，时间范围={st:%Y-%m-%d}~{et:%Y-%m-%d}"
+            _progress(progress_cb, 92, "EDC: 无匹配数据，正在结束任务")
+            return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
         range_raw, _range_points = _pick_daily_95_from_rows(full_rows, rank_index)
 
         # Optional "data budget" summary: convert raw settlement by custom formula.
@@ -566,6 +570,18 @@ def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_format
     return artifacts
 
 
+
+def _make_terminal_no_data_artifact(job_id: str, filename_noext: str, reason: str) -> Dict[str, Any]:
+    txt = safe_artifact_path(job_id, f"{filename_noext}-no_data.txt")
+    txt.write_text(f"{reason}\n", encoding="utf-8")
+    return {
+        "filename": txt.name,
+        "size": txt.stat().st_size,
+        "path": str(txt),
+        "terminal_code": "NO_MATCH",
+        "terminal_reason": reason,
+    }
+
 def compute_and_export(
     job_id: str,
     resolved_window: Dict[str, Any],
@@ -640,6 +656,9 @@ def compute_and_export(
             'password': selected_cfg.get('password'),
             'db': selected_cfg.get('db'),
             'charset': selected_cfg.get('charset', 'utf8mb4'),
+            'connect_timeout': int(selected_cfg.get('connect_timeout', 10)),
+            'read_timeout': int(selected_cfg.get('read_timeout', 120)),
+            'write_timeout': int(selected_cfg.get('write_timeout', 120)),
         }
     if not db_cfg:
         # use ini path relative to server/ directory
@@ -657,11 +676,31 @@ def compute_and_export(
         _progress(progress_cb, 8, "NFA: 已连接数据源，加载匹配对象")
         schools = c95.get_schools_by_province_and_cp(conn, province, cp, school)
         if not schools:
-            # 无数据时输出一份说明文件
-            txt = safe_artifact_path(job_id, f"{_build_base_filename(params, window_label, output_filename_template, end_date)}-no_data.txt")
-            txt.write_text("No schools matched the filter.", encoding="utf-8")
-            artifacts.append({"filename": txt.name, "size": txt.stat().st_size, "path": str(txt)})
+            reason = f"NFA 无匹配对象：省份={province}，CP={cp}" + (f"，院校={school}" if school else "")
+            artifacts.append(
+                _make_terminal_no_data_artifact(
+                    job_id,
+                    _build_base_filename(params, window_label, output_filename_template, end_date),
+                    reason,
+                )
+            )
             return artifacts
+
+        base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
+        _progress(progress_cb, 9, "NFA: 预筛选窗口内有流量对象")
+        pairs_all = [(s["ipgroup_id"], s["nfa_uuid"]) for s in schools]
+        probe_batch = max(100, min(1000, int(batch_size)))
+        if hasattr(c95, "filter_pairs_with_data"):
+            active_pairs = c95.filter_pairs_with_data(conn, pairs_all, start_time, end_time, batch_size=probe_batch)
+        else:
+            active_pairs = None
+            _progress(progress_cb, 9, "NFA: 预筛函数缺失，跳过预筛")
+        if active_pairs is not None:
+            schools = [s for s in schools if (s.get("ipgroup_id"), s.get("nfa_uuid")) in active_pairs]
+            if not schools:
+                reason = f"NFA 无匹配流量数据：省份={province}，CP={cp}，窗口={window_label}"
+                return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
+            _progress(progress_cb, 11, f"NFA: 窗口内有数据对象 {len(schools)}/{len(pairs_all)}")
 
         # Helper: split [start_time, end_time] into calendar months
         def _month_ranges(start_s: str, end_s: str):
@@ -950,12 +989,7 @@ def compute_and_export(
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
                         direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
-                    if not rows_daily:
-                        rows_daily = c95.process_schools(
-                            conn, schools,
-                            pd.to_datetime(start_time), pd.to_datetime(end_time),
-                            direction, True, unit_base=unit_base
-                        )
+                    # 不再回退到逐院校单查：空结果即表示该窗口无匹配流量数据
                     df_daily = _to_dataframe(rows_daily)
                     if export_daily:
                         df = df_daily
@@ -976,14 +1010,11 @@ def compute_and_export(
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
                         direction, export_daily, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
                     )
-                    if not rows:
-                        # 回退到原方法
-                        rows = c95.process_schools(
-                            conn, schools,
-                            pd.to_datetime(start_time), pd.to_datetime(end_time),
-                            direction, export_daily, unit_base=unit_base
-                        )
+                    # 不再回退到原逐院校方法：避免无数据场景下逐校空查导致长时间运行
                     df = _to_dataframe(rows)
+                if df is None or df.empty:
+                    reason = f"NFA 无匹配流量数据：省份={province}，CP={cp}，窗口={window_label}"
+                    return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 _progress(progress_cb, 92, "NFA: 正在导出产物")

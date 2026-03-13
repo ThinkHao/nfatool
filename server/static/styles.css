@@ -73,6 +73,28 @@ p {
   text-align: center;
 }
 
+.notice-bar {
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
+  border: 1px solid #d8e6ef;
+  background: #f3f9ff;
+  color: #16425a;
+  font-size: 13px;
+}
+
+.notice-bar.nb-warning {
+  border-color: #f2d39b;
+  background: #fff8ea;
+  color: #7a4a00;
+}
+
+.notice-bar.nb-error {
+  border-color: #f5b8b5;
+  background: #fff1f1;
+  color: #842029;
+}
+
 section {
   background: var(--card);
   border: 1px solid #e5eaf0;
@@ -558,3 +580,4 @@ a:hover { text-decoration: underline; }
     white-space: nowrap;
   }
 }
+

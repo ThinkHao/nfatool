@@ -31,6 +31,8 @@
       </div>
     </header>
 
+    <div v-if="notice.message" :class="['notice-bar', 'nb-' + (notice.kind || 'info')]">{{ notice.message }}</div>
+
     <section class="tool-switches">
       <div class="row">
         <button class="btn-muted" @click="ui.showSourceAdmin = !ui.showSourceAdmin">{{ ui.showSourceAdmin ? '收起数据源配置' : '展开数据源配置' }}</button>
@@ -545,6 +547,9 @@
                 <div class="item-sub" v-if="r.progress_stage">
                   进度：{{ r.progress_pct || 0 }}% · {{ r.progress_stage }}
                 </div>
+                <div class="item-sub" v-if="runEndReason(r)">
+                  结束原因：{{ runEndReason(r) }}
+                </div>
                 <div class="progress" v-if="r.status==='running' || r.status==='pending'">
                   <div class="progress-inner" :style="{ width: (r.progress_pct || 0) + '%' }"></div>
                 </div>
@@ -586,3 +591,6 @@
   <script src="/static/app.js?v=20260303-04"></script>
 </body>
 </html>
+
+
+

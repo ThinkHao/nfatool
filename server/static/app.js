@@ -29,6 +29,7 @@ createApp({
       runsPageJump: 1,
       dataSourceCatalog: { nfa: ['default'], edc: [] },
       ui: { showSourceAdmin: false, showBulkImport: false },
+      notice: { message: '', kind: 'info', at: 0 },
       sourceAdmin: {
         source_type: 'all',
         items: [],
@@ -84,6 +85,70 @@ createApp({
     }
   },
   methods: {
+    async extractApiError(res, fallback = '') {
+      const fallbackMsg = fallback || `请求失败(${res.status})`
+      if (!res) return fallbackMsg
+      let data = null
+      let text = ''
+      try { data = await res.clone().json() } catch (_) {}
+      if (!data) {
+        try { text = String(await res.clone().text() || '').trim() } catch (_) {}
+      }
+      let msg = ''
+      if (data && typeof data === 'object') {
+        if (typeof data.detail === 'string') msg = data.detail
+        else if (data.detail && typeof data.detail === 'object') msg = String(data.detail.message || data.detail.detail || data.detail.code || '').trim()
+        if (!msg && typeof data.message === 'string') msg = data.message
+        if (!msg && typeof data.error === 'string') msg = data.error
+      }
+      if (!msg && text) {
+        msg = text
+        try {
+          const parsed = JSON.parse(text)
+          if (parsed && typeof parsed === 'object') {
+            if (typeof parsed.detail === 'string') msg = parsed.detail
+            else if (parsed.detail && typeof parsed.detail === 'object') msg = String(parsed.detail.message || parsed.detail.detail || parsed.detail.code || '').trim()
+            else if (typeof parsed.message === 'string') msg = parsed.message
+          }
+        } catch (_) {}
+      }
+      if (!msg) msg = fallbackMsg
+      if (/Task name already exists/i.test(msg) || /UNIQUE constraint failed: tasks\.name/i.test(msg)) {
+        msg = '任务名称已存在，请更换后重试'
+      }
+      return msg
+    },
+    async showApiError(action, res, fallback = '') {
+      const msg = await this.extractApiError(res, fallback)
+      alert(`${action}失败：${msg}`)
+      return msg
+    },
+    notify(message, kind = 'info', durationMs = 3800) {
+      const msg = String(message || '').trim()
+      if (!msg) return
+      const now = Date.now()
+      const lastMsg = String((this.notice && this.notice.message) || '')
+      const lastAt = Number((this.notice && this.notice.at) || 0)
+      if (lastMsg === msg && (now - lastAt) < 3000) return
+      this.notice = { message: msg, kind: kind || 'info', at: now }
+      if (this._noticeTimer) clearTimeout(this._noticeTimer)
+      if (durationMs > 0) {
+        this._noticeTimer = setTimeout(() => {
+          if ((this.notice && this.notice.message) === msg) {
+            this.notice = { message: '', kind: 'info', at: 0 }
+          }
+        }, durationMs)
+      }
+    },
+    runEndReason(run) {
+      if (!run || typeof run !== 'object') return ''
+      if (run.error_message) return String(run.error_message)
+      if (Array.isArray(run.artifacts)) {
+        const marked = run.artifacts.find((a) => a && typeof a === 'object' && a.terminal_reason)
+        if (marked && marked.terminal_reason) return String(marked.terminal_reason)
+      }
+      return ''
+    },
     // 将 'YYYY-MM-DD HH:MM:SS' 转换为 <input type=datetime-local> 需要的 'YYYY-MM-DDTHH:MM:SS'
     toLocalInputString(str) {
       if (!str || typeof str !== 'string') return ''
@@ -174,8 +239,8 @@ createApp({
       try {
         const res = await apiFetch('/api/meta/update', {}, this.apiKey)
         if (!res.ok) {
-          const txt = await res.text()
-          this.updateInfo = { ok: false, message: txt }
+          const msg = await this.extractApiError(res, '检查更新失败')
+          this.updateInfo = { ok: false, message: msg }
           return
         }
         this.updateInfo = await res.json()
@@ -193,8 +258,7 @@ createApp({
         const payload = { restart_after_update: true }
         const res = await apiFetch('/api/meta/update/apply', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
         if (!res.ok) {
-          const txt = await res.text()
-          alert('升级失败: ' + txt)
+          await this.showApiError('升级', res)
           return
         }
         const data = await res.json()
@@ -206,7 +270,10 @@ createApp({
     async loadDataSources() {
       try {
         const res = await apiFetch('/api/meta/data-sources', {}, this.apiKey)
-        if (!res.ok) return
+        if (!res.ok) {
+          this.notify(await this.extractApiError(res, '加载数据源列表失败'), 'warning')
+          return
+        }
         const data = await res.json()
         const nfa = Array.isArray(data.nfa) && data.nfa.length ? data.nfa : ['default']
         const edc = Array.isArray(data.edc) ? data.edc : []
@@ -220,8 +287,8 @@ createApp({
         }
         this.onSourceTypeChange(this.newTask)
         if (this.editTask) this.onSourceTypeChange(this.editTask)
-      } catch (_) {
-        // ignore loading error
+      } catch (e) {
+        this.notify('加载数据源列表失败：' + String(e), 'warning')
       }
     },
     prettyJson(v) {
@@ -234,7 +301,10 @@ createApp({
     async loadSourceAdminInstances() {
       const st = this.sourceAdmin.source_type || 'all'
       const res = await apiFetch('/api/meta/data-sources/instances?source_type=' + encodeURIComponent(st), {}, this.apiKey)
-      if (!res.ok) return
+      if (!res.ok) {
+        this.notify(await this.extractApiError(res, '加载实例列表失败'), 'warning')
+        return
+      }
       const data = await res.json()
       const items = Array.isArray(data.items) ? data.items : []
       this.sourceAdmin.items = items
@@ -274,8 +344,7 @@ createApp({
       const payload = { source_type: st, instance: name, config: cfg }
       const res = await apiFetch('/api/meta/data-sources/instances', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('创建实例失败: ' + txt)
+        await this.showApiError('创建实例', res)
         return
       }
       this.sourceAdmin.new_instance = ''
@@ -297,8 +366,7 @@ createApp({
       const payload = { source_type: st, instance: name, config: cfg }
       const res = await apiFetch('/api/meta/data-sources/instances', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('保存失败: ' + txt)
+        await this.showApiError('保存实例', res)
         return
       }
       await this.loadSourceAdminInstances()
@@ -313,8 +381,7 @@ createApp({
       const q = new URLSearchParams({ source_type: st, instance: name }).toString()
       const res = await apiFetch('/api/meta/data-sources/instances?' + q, { method: 'DELETE' }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('删除失败: ' + txt)
+        await this.showApiError('删除实例', res)
         return
       }
       await this.loadSourceAdminInstances()
@@ -333,8 +400,8 @@ createApp({
       const payload = { source_type: st, instance: name || null, config: cfg }
       const res = await apiFetch('/api/meta/data-sources/test', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        this.sourceAdmin.test_result = { ok: false, message: txt, elapsed_ms: 0 }
+        const msg = await this.extractApiError(res, '连接测试失败')
+        this.sourceAdmin.test_result = { ok: false, message: msg, elapsed_ms: 0 }
         return
       }
       const data = await res.json()
@@ -343,7 +410,10 @@ createApp({
     async loadSourceAdminAudit() {
       const n = Number(this.sourceAdmin.audit_limit || 50)
       const res = await apiFetch('/api/meta/data-sources/audit?limit=' + encodeURIComponent(String(n)), {}, this.apiKey)
-      if (!res.ok) return
+      if (!res.ok) {
+        this.notify(await this.extractApiError(res, '加载配置审计失败'), 'warning')
+        return
+      }
       const data = await res.json()
       this.sourceAdmin.audit_items = Array.isArray(data.items) ? data.items : []
     },
@@ -355,8 +425,7 @@ createApp({
       const payload = { old_seed: oldSeed, new_seed: newSeed }
       const res = await apiFetch('/api/meta/data-sources/rotate-key', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('密钥轮换失败: ' + txt)
+        await this.showApiError('密钥轮换', res)
         return
       }
       const data = await res.json()
@@ -367,7 +436,10 @@ createApp({
     },
     async loadRotatePolicy() {
       const res = await apiFetch('/api/meta/data-sources/rotate-policy', {}, this.apiKey)
-      if (!res.ok) return
+      if (!res.ok) {
+        this.notify(await this.extractApiError(res, '加载轮换策略失败'), 'warning')
+        return
+      }
       const data = await res.json()
       this.sourceAdmin.rotate_policy = {
         enabled: !!data.enabled,
@@ -383,8 +455,7 @@ createApp({
       }
       const res = await apiFetch('/api/meta/data-sources/rotate-policy', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('保存轮换策略失败: ' + txt)
+        await this.showApiError('保存轮换策略', res)
         return
       }
       const data = await res.json()
@@ -399,8 +470,7 @@ createApp({
       if (!confirm('确认立即执行一次自动密钥轮换？')) return
       const res = await apiFetch('/api/meta/data-sources/rotate-key-auto?force=true', { method: 'POST' }, this.apiKey)
       if (!res.ok) {
-        const txt = await res.text()
-        alert('自动轮换失败: ' + txt)
+        await this.showApiError('自动轮换', res)
         return
       }
       const data = await res.json()
@@ -518,7 +588,7 @@ createApp({
       }
       const res = await apiFetch('/api/tasks', {}, this.apiKey)
       if (!res.ok) {
-        alert('预检失败：无法加载现有任务')
+        await this.showApiError('预检任务冲突', res, '无法加载现有任务')
         return
       }
       const existing = await res.json()
@@ -621,8 +691,8 @@ createApp({
           if (res.ok) {
             ok++
           } else {
-            const txt = await res.text()
-            failures.push(`${payload.name}: ${txt}`)
+            const msg = await this.extractApiError(res, '导入失败')
+            failures.push(`${payload.name}: ${msg}`)
           }
         } catch (e) {
           failures.push(`${payload.name}: ${String(e)}`)
@@ -647,7 +717,7 @@ createApp({
       if (this.tasksQuery && this.tasksQuery.sort_by) params.set('sort_by', this.tasksQuery.sort_by)
       if (this.tasksQuery && this.tasksQuery.sort_order) params.set('sort_order', this.tasksQuery.sort_order)
       const res = await apiFetch('/api/tasks/page?' + params.toString(), {}, this.apiKey)
-      if (!res.ok) { alert('任务列表加载失败'); return }
+      if (!res.ok) { await this.showApiError('任务列表加载', res); return }
       const data = await res.json()
       this.tasksPage = { items: data.items || [], total: data.total || 0, page: data.page || page, page_size: data.page_size || pageSize }
       this.tasks = this.tasksPage.items
@@ -665,7 +735,7 @@ createApp({
       this.normalizeCustomWindow(payload)
       this._deepTrimValue(payload)
       const res = await apiFetch('/api/tasks', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
-      if (!res.ok) { alert('创建失败'); return }
+      if (!res.ok) { await this.showApiError('创建任务', res); return }
       await this.loadTasks()
     },
     startEdit(t) {
@@ -707,7 +777,7 @@ createApp({
       this.normalizeCustomWindow(body)
       this._deepTrimValue(body)
       const res = await apiFetch('/api/tasks/' + this.editTask.id, { method: 'PUT', body: JSON.stringify(body) }, this.apiKey)
-      if (!res.ok) { const txt = await res.text(); alert('保存失败: ' + txt); return }
+      if (!res.ok) { await this.showApiError('保存任务', res); return }
       this.editTask = null
       await this.loadTasks()
     },
@@ -731,7 +801,7 @@ createApp({
     async removeTask(id) {
       if (!confirm('确认删除?')) return
       const res = await apiFetch('/api/tasks/' + id, { method: 'DELETE' }, this.apiKey)
-      if (!res.ok) { alert('删除失败'); return }
+      if (!res.ok) { await this.showApiError('删除任务', res); return }
       const curPage = this.tasksPage.page
       await this.loadTasksPage(curPage, this.tasksPage.page_size)
       if (this.tasks.length === 0 && curPage > 1) {
@@ -740,7 +810,7 @@ createApp({
     },
     async runTask(id) {
       const res = await apiFetch('/api/tasks/' + id + '/run', { method: 'POST' }, this.apiKey)
-      if (!res.ok) { alert('触发失败'); return }
+      if (!res.ok) { await this.showApiError('触发任务', res); return }
       const data = await res.json(); alert('已触发: ' + data.job_id)
       await this.loadRuns()
     },
@@ -762,7 +832,7 @@ createApp({
       if (this.runsQuery && this.runsQuery.sort_by) params.set('sort_by', this.runsQuery.sort_by)
       if (this.runsQuery && this.runsQuery.sort_order) params.set('sort_order', this.runsQuery.sort_order)
       const res = await apiFetch('/api/jobs/page?' + params.toString(), {}, this.apiKey)
-      if (!res.ok) { alert('加载失败'); return }
+      if (!res.ok) { await this.showApiError('加载运行记录', res); return }
       const data = await res.json()
       this.runsPage = { items: data.items || [], total: data.total || 0, page: data.page || page, page_size: data.page_size || pageSize }
       this.runs = this.runsPage.items
@@ -913,7 +983,7 @@ createApp({
       if (!this.selectedTaskIds.length) { alert('请先选择任务'); return }
       if (!confirm(`确认删除选中的 ${this.selectedTaskIds.length} 个任务？`)) return
       const res = await apiFetch('/api/tasks/batch-delete', { method: 'POST', body: JSON.stringify({ ids: this.selectedTaskIds }) }, this.apiKey)
-      if (!res.ok) { alert('批量删除任务失败'); return }
+      if (!res.ok) { await this.showApiError('批量删除任务', res); return }
       this.selectedTaskIds = []
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
     },
@@ -928,8 +998,8 @@ createApp({
           if (res.ok) {
             ok++
           } else {
-            const txt = await res.text()
-            failures.push(`#${id}: ${txt}`)
+            const msg = await this.extractApiError(res, '触发失败')
+            failures.push(`#${id}: ${msg}`)
           }
         } catch (e) {
           failures.push(`#${id}: ${String(e)}`)
@@ -944,7 +1014,7 @@ createApp({
       if (!this.selectedRunIds.length) { alert('请先选择运行记录'); return }
       if (!confirm(`确认删除选中的 ${this.selectedRunIds.length} 条运行记录？`)) return
       const res = await apiFetch('/api/jobs/batch-delete', { method: 'POST', body: JSON.stringify({ ids: this.selectedRunIds }) }, this.apiKey)
-      if (!res.ok) { alert('批量删除运行记录失败'); return }
+      if (!res.ok) { await this.showApiError('批量删除运行记录', res); return }
       this.selectedRunIds = []
       await this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
     },
@@ -958,8 +1028,7 @@ createApp({
       }
       const res = await apiFetch('/api/jobs/batch-download', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
       if (!res.ok) {
-        const msg = await res.text()
-        alert('批量下载失败: ' + msg)
+        await this.showApiError('批量下载', res)
         return
       }
       const blob = await res.blob()
@@ -985,7 +1054,10 @@ createApp({
         file_format: this.runsQuery.file_format || 'csv'
       }
       const res = await apiFetch('/api/jobs/batch-download/preview', { method: 'POST', body: JSON.stringify(payload) }, this.apiKey)
-      if (!res.ok) return
+      if (!res.ok) {
+        this.notify(await this.extractApiError(res, '下载预览计算失败'), 'warning', 2600)
+        return
+      }
       const data = await res.json()
       this.downloadPreview = {
         matched_runs: Number(data.matched_runs || 0),
@@ -1143,16 +1215,15 @@ createApp({
     async toggleActive(t) {
       const body = { active: !t.active }
       const res = await apiFetch('/api/tasks/' + t.id, { method: 'PUT', body: JSON.stringify(body) }, this.apiKey)
-      if (!res.ok) { const txt = await res.text(); alert('切换失败: ' + txt); return }
+      if (!res.ok) { await this.showApiError('切换任务状态', res); return }
       await this.loadTasks()
     },
     async deleteRun(id) {
       if (!confirm('确认删除该运行记录及产物？')) return
       try {
         const res = await apiFetch('/api/jobs/' + id, { method: 'DELETE' }, this.apiKey)
-        const text = await res.text()
         if (!res.ok) {
-          alert(`删除失败: ${res.status} ${text}`)
+          await this.showApiError('删除运行记录', res)
           return
         }
         const curPage = this.runsPage.page
@@ -1213,5 +1284,11 @@ createApp({
   },
   unmounted() {
     if (this._runTimer) clearInterval(this._runTimer)
+    if (this._noticeTimer) clearTimeout(this._noticeTimer)
   }
 }).mount('#app')
+
+
+
+
+
