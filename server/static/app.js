@@ -13,6 +13,7 @@ createApp({
       apiKey: '',
       health: '-',
       updateInfo: null,
+      updateStatus: { status: 'idle', running: false, message: '' },
       updateChecking: false,
       updateApplying: false,
       tasks: [],
@@ -249,9 +250,50 @@ createApp({
       } finally {
         this.updateChecking = false
       }
+      await this.refreshUpdateStatus(true)
+    },
+    async refreshUpdateStatus(silent = false) {
+      try {
+        const res = await apiFetch('/api/meta/update/status', {}, this.apiKey)
+        if (!res.ok) {
+          if (!silent) this.notify(await this.extractApiError(res, '获取升级状态失败'), 'warning')
+          return null
+        }
+        const data = await res.json()
+        this.updateStatus = data || { status: 'unknown', running: false }
+        if (this.updateStatus && this.updateStatus.running) {
+          this.startUpdateStatusPolling()
+        } else {
+          this.stopUpdateStatusPolling()
+        }
+        return this.updateStatus
+      } catch (e) {
+        if (!silent) this.notify('获取升级状态失败：' + String(e), 'warning')
+        return null
+      }
+    },
+    startUpdateStatusPolling() {
+      if (this._updateStatusTimer) return
+      this._updateStatusTimer = setInterval(async () => {
+        const st = await this.refreshUpdateStatus(true)
+        if (!st || st.running) return
+        this.stopUpdateStatusPolling()
+        if (st.status === 'failed') {
+          this.notify(`升级失败：${st.last_error || st.message || '未知原因'}`, 'warning', 10000)
+        } else if (st.status === 'succeeded') {
+          this.notify('升级成功，服务已完成切换', 'info', 6000)
+        }
+      }, 5000)
+    },
+    stopUpdateStatusPolling() {
+      if (this._updateStatusTimer) {
+        clearInterval(this._updateStatusTimer)
+        this._updateStatusTimer = null
+      }
     },
     async applyUpdate() {
       if (!this.updateInfo || !this.updateInfo.update_available) { alert('当前已是最新版本'); return }
+      if (this.updateStatus && this.updateStatus.running) { alert('已有升级任务正在执行，请稍后重试'); return }
       if (!confirm(`确认升级到 ${this.updateInfo.latest_version}？升级后将自动重启当前进程。`)) return
       this.updateApplying = true
       try {
@@ -262,6 +304,12 @@ createApp({
           return
         }
         const data = await res.json()
+        await this.refreshUpdateStatus(true)
+        if (data && data.mode === 'external-script') {
+          this.notify('升级任务已提交，正在后台执行，请关注升级状态', 'info', 8000)
+          this.startUpdateStatusPolling()
+          return
+        }
         alert(`升级已执行：${data.message || 'ok'}。服务正在重启，请稍后刷新页面。`)
       } finally {
         this.updateApplying = false
@@ -1271,6 +1319,7 @@ createApp({
   mounted() {
     this.checkHealth()
     this.checkUpdate()
+    this.refreshUpdateStatus(true)
     this.loadDataSources()
     this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
     this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
@@ -1284,6 +1333,7 @@ createApp({
   },
   unmounted() {
     if (this._runTimer) clearInterval(this._runTimer)
+    this.stopUpdateStatusPolling()
     if (this._noticeTimer) clearTimeout(this._noticeTimer)
   }
 }).mount('#app')

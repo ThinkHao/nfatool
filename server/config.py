@@ -69,6 +69,13 @@ class Settings(BaseSettings):
     UPDATE_HEALTHCHECK_URL: str = "http://127.0.0.1:8000/api/health"
     UPDATE_HEALTHCHECK_TIMEOUT_SEC: int = 45
     UPDATE_RUNNER_LOG: Optional[str] = None
+    UPDATE_STATE_FILE: Optional[str] = None
+    UPDATE_STATUS_STALE_SEC: int = 7200
+    UPDATE_DOWNLOAD_MAX_TIME_SEC: int = 1800
+    UPDATE_DOWNLOAD_RETRY: int = 8
+    UPDATE_DOWNLOAD_RETRY_DELAY_SEC: int = 3
+    UPDATE_DOWNLOAD_LOW_SPEED_TIME_SEC: int = 30
+    UPDATE_DOWNLOAD_LOW_SPEED_LIMIT_BPS: int = 10240
 
     model_config = SettingsConfigDict(env_file=str(BASE_DIR / ".env"), env_file_encoding="utf-8", case_sensitive=False)
 

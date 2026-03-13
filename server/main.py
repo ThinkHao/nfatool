@@ -50,7 +50,7 @@ from .services import scheduler as scheduler_service
 from .services.storage import get_job_dir
 from .services.logger import get_job_log_path
 from .services.compute95 import _connect_edc_db
-from .services.updater import check_update, apply_update
+from .services.updater import check_update, apply_update, get_update_status
 
 app = FastAPI(title="NFA 95th Web Service", version="0.1.0")
 
@@ -277,6 +277,14 @@ async def apply_update_api(payload: UpdateApplyPayload):
         return apply_update(restart_after_update=bool(payload.restart_after_update))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/api/meta/update/status", dependencies=[Depends(api_key_auth)])
+async def get_update_status_api():
+    try:
+        return get_update_status()
+    except Exception as e:
+        return {"ok": False, "status": "unknown", "running": False, "message": str(e)}
 
 
 @app.post("/api/meta/data-sources/test", dependencies=[Depends(api_key_auth)])

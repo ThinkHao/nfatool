@@ -109,8 +109,16 @@ UPDATE_SERVICE_NAME=nfa95.service
 UPDATE_HEALTHCHECK_URL=http://127.0.0.1:8000/api/health
 UPDATE_HEALTHCHECK_TIMEOUT_SEC=45
 UPDATE_RUNNER_LOG=/home/nfa95/logs/update-runner.log
+UPDATE_STATE_FILE=/home/nfa95/logs/update-runner.state
+UPDATE_STATUS_STALE_SEC=7200
+UPDATE_DOWNLOAD_MAX_TIME_SEC=1800
+UPDATE_DOWNLOAD_RETRY=8
+UPDATE_DOWNLOAD_RETRY_DELAY_SEC=3
+UPDATE_DOWNLOAD_LOW_SPEED_TIME_SEC=30
+UPDATE_DOWNLOAD_LOW_SPEED_LIMIT_BPS=10240
 ```
 3. Web 点击“一键升级”后，后端会触发外部脚本执行两阶段切换与健康检查；失败将自动回滚并重启旧版本。
+4. 可通过 `GET /api/meta/update/status` 查看升级状态（running/succeeded/failed）和失败原因。
 
 备注：
 

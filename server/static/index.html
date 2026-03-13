@@ -21,13 +21,16 @@
         <input v-model.trim="apiKey" placeholder="X-API-KEY" />
         <button @click="checkHealth">健康检查</button>
         <button class="btn-muted" @click="checkUpdate" :disabled="updateChecking">{{ updateChecking ? '检测中...' : '检测更新' }}</button>
-        <button v-if="updateInfo && updateInfo.update_available" @click="applyUpdate" :disabled="updateApplying">{{ updateApplying ? '升级中...' : '一键升级' }}</button>
+        <button v-if="updateInfo && updateInfo.update_available" @click="applyUpdate" :disabled="updateApplying || (updateStatus && updateStatus.running)">{{ updateApplying ? '升级中...' : ((updateStatus && updateStatus.running) ? '升级执行中...' : '一键升级') }}</button>
         <span class="status-dot">{{ health }}</span>
         <span class="hint" v-if="updateInfo && updateInfo.ok">
           版本：{{ updateInfo.current_version || '-' }} / {{ updateInfo.latest_version || '-' }}
           {{ updateInfo.update_available ? '（可升级）' : '（最新）' }}
         </span>
         <span class="hint" v-if="updateInfo && !updateInfo.ok">更新检测失败：{{ updateInfo.message }}</span>
+        <span class="hint" v-if="updateStatus && updateStatus.status && updateStatus.status !== 'idle'">
+          升级状态：{{ updateStatus.status }}{{ updateStatus.message ? ('，' + updateStatus.message) : '' }}
+        </span>
       </div>
     </header>
 
@@ -588,7 +591,7 @@
       </section>
     </div>
   </div>
-  <script src="/static/app.js?v=20260303-04"></script>
+  <script src="/static/app.js?v=20260313-01"></script>
 </body>
 </html>
 
