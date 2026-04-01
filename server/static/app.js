@@ -18,18 +18,21 @@ createApp({
       updateApplying: false,
       tasks: [],
       runs: [],
+      taskGroups: [],
       tasksPage: { items: [], total: 0, page: 1, page_size: 20 },
       runsPage: { items: [], total: 0, page: 1, page_size: 20 },
       selectedTaskIds: [],
       selectedRunIds: [],
       downloadPreview: { matched_runs: 0, matched_files: 0 },
       runsFilterTaskId: null,
-      tasksQuery: { q: '', sort_by: 'id', sort_order: 'desc' },
+      tasksQuery: { q: '', task_kind: 'all', task_group: '', sort_by: 'id', sort_order: 'desc' },
       runsQuery: { status: '', sort_by: 'started_at', sort_order: 'desc', month: '', task_kind: 'all', file_format: 'csv' },
       tasksPageJump: 1,
       runsPageJump: 1,
       dataSourceCatalog: { nfa: ['default'], edc: [] },
       ui: { showSourceAdmin: false, showBulkImport: false },
+      groupAdmin: { new_name: '', selected_name: '', rename_to: '' },
+      groupAssignSavingTaskId: null,
       notice: { message: '', kind: 'info', at: 0 },
       sourceAdmin: {
         source_type: 'all',
@@ -68,6 +71,7 @@ createApp({
       },
       newTask: {
         name: '',
+        group_name: '',
         active: true,
         kind: 'one_off',
         data_source_type: 'nfa',
@@ -747,6 +751,7 @@ createApp({
         }
       }
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
       let msg = `导入完成：成功 ${ok}，失败 ${failures.length}`
       if (failures.length) {
         msg += `\n失败示例：\n${failures.slice(0, 5).join('\n')}`
@@ -756,12 +761,100 @@ createApp({
     },
     async loadTasks() {
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
+    },
+    async loadTaskGroups() {
+      const res = await apiFetch('/api/tasks/groups', {}, this.apiKey)
+      if (!res.ok) { return }
+      const data = await res.json()
+      this.taskGroups = Array.isArray(data.items) ? data.items : []
+      if (this.tasksQuery.task_group && !this.taskGroups.includes(this.tasksQuery.task_group)) {
+        this.tasksQuery.task_group = ''
+      }
+      if (this.groupAdmin.selected_name && !this.taskGroups.includes(this.groupAdmin.selected_name)) {
+        this.groupAdmin.selected_name = ''
+        this.groupAdmin.rename_to = ''
+      }
+    },
+    async createTaskGroup() {
+      const name = String(this.groupAdmin.new_name || '').trim()
+      if (!name) { alert('请输入分组名'); return }
+      const res = await apiFetch('/api/tasks/groups', { method: 'POST', body: JSON.stringify({ name }) }, this.apiKey)
+      if (!res.ok) { await this.showApiError('创建分组', res); return }
+      this.groupAdmin.new_name = ''
+      await this.loadTaskGroups()
+      this.groupAdmin.selected_name = name
+      this.groupAdmin.rename_to = name
+      this.notify('分组创建成功', 'info', 2000)
+    },
+    onSelectGroupAdmin() {
+      this.groupAdmin.rename_to = this.groupAdmin.selected_name || ''
+    },
+    async renameTaskGroup() {
+      const oldName = String(this.groupAdmin.selected_name || '').trim()
+      const newName = String(this.groupAdmin.rename_to || '').trim()
+      if (!oldName) { alert('请先选择分组'); return }
+      if (!newName) { alert('请输入新分组名'); return }
+      let merge = false
+      if (oldName !== newName && this.taskGroups.includes(newName)) {
+        if (!confirm(`目标分组「${newName}」已存在，确认合并到该分组吗？`)) return
+        merge = true
+      }
+      const payload = { old_name: oldName, new_name: newName, merge }
+      const res = await apiFetch('/api/tasks/groups/rename', { method: 'PATCH', body: JSON.stringify(payload) }, this.apiKey)
+      if (!res.ok) { await this.showApiError('重命名分组', res); return }
+      await this.loadTaskGroups()
+      this.groupAdmin.selected_name = newName
+      this.groupAdmin.rename_to = newName
+      await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      this.notify('分组重命名成功', 'info', 2200)
+    },
+    async deleteTaskGroup() {
+      const name = String(this.groupAdmin.selected_name || '').trim()
+      if (!name) { alert('请先选择分组'); return }
+      if (!confirm(`确认删除分组「${name}」？该分组下任务会变为未分组。`)) return
+      const res = await apiFetch('/api/tasks/groups?name=' + encodeURIComponent(name), { method: 'DELETE' }, this.apiKey)
+      if (!res.ok) { await this.showApiError('删除分组', res); return }
+      this.groupAdmin.selected_name = ''
+      this.groupAdmin.rename_to = ''
+      await this.loadTaskGroups()
+      await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      this.notify('分组删除成功', 'info', 2200)
+    },
+    async quickAssignTaskGroup(task, value) {
+      if (!task || !task.id) return
+      const next = String(value || '').trim()
+      const target = next || null
+      const current = task.group_name ? String(task.group_name) : null
+      if (target === current) return
+      const prev = current
+      task.group_name = target
+      this.groupAssignSavingTaskId = Number(task.id)
+      try {
+        const payload = { group_name: target }
+        const res = await apiFetch('/api/tasks/' + task.id + '/group', { method: 'PATCH', body: JSON.stringify(payload) }, this.apiKey)
+        if (!res.ok) {
+          task.group_name = prev
+          await this.showApiError('修改任务分组', res)
+          return
+        }
+        const data = await res.json()
+        task.group_name = data.group_name || null
+        await this.loadTaskGroups()
+        if (this.tasksQuery.task_group) {
+          await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+        }
+      } finally {
+        this.groupAssignSavingTaskId = null
+      }
     },
     async loadTasksPage(page = 1, pageSize = 20) {
       const params = new URLSearchParams()
       params.set('page', String(page))
       params.set('page_size', String(pageSize))
       if (this.tasksQuery && this.tasksQuery.q) params.set('q', this.tasksQuery.q)
+      if (this.tasksQuery && this.tasksQuery.task_kind && this.tasksQuery.task_kind !== 'all') params.set('task_kind', this.tasksQuery.task_kind)
+      if (this.tasksQuery && this.tasksQuery.task_group) params.set('task_group', this.tasksQuery.task_group)
       if (this.tasksQuery && this.tasksQuery.sort_by) params.set('sort_by', this.tasksQuery.sort_by)
       if (this.tasksQuery && this.tasksQuery.sort_order) params.set('sort_order', this.tasksQuery.sort_order)
       const res = await apiFetch('/api/tasks/page?' + params.toString(), {}, this.apiKey)
@@ -818,7 +911,7 @@ createApp({
       this.normalizeSourceParams(this.editTask)
       this.normalizeCustomWindow(this.editTask)
       if (!this.validateTask(this.editTask)) return
-      const allowKeys = ['name','active','kind','data_source_type','data_source_instance','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
+      const allowKeys = ['name','group_name','active','kind','data_source_type','data_source_instance','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
       const body = {}
       for (const k of allowKeys) { if (k in this.editTask) body[k] = this.editTask[k] }
       this.normalizeSourceParams(body)
@@ -855,6 +948,7 @@ createApp({
       if (this.tasks.length === 0 && curPage > 1) {
         await this.loadTasksPage(curPage - 1, this.tasksPage.page_size)
       }
+      await this.loadTaskGroups()
     },
     async runTask(id) {
       const res = await apiFetch('/api/tasks/' + id + '/run', { method: 'POST' }, this.apiKey)
@@ -890,6 +984,12 @@ createApp({
       this.previewBatchDownload()
     },
     applyTasksQuery() {
+      this.loadTasksPage(1, this.tasksPage.page_size)
+    },
+    clearTasksQuery() {
+      this.tasksQuery.q = ''
+      this.tasksQuery.task_kind = 'all'
+      this.tasksQuery.task_group = ''
       this.loadTasksPage(1, this.tasksPage.page_size)
     },
     applyRunsQuery() {
@@ -1034,6 +1134,7 @@ createApp({
       if (!res.ok) { await this.showApiError('批量删除任务', res); return }
       this.selectedTaskIds = []
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
     },
     async batchRunTasks() {
       if (!this.selectedTaskIds.length) { alert('请先选择任务'); return }
@@ -1321,6 +1422,7 @@ createApp({
     this.checkUpdate()
     this.refreshUpdateStatus(true)
     this.loadDataSources()
+    this.loadTaskGroups()
     this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
     this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
     this.previewBatchDownload()
