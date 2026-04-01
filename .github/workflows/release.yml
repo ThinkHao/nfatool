@@ -144,33 +144,13 @@ jobs:
           parse_json_field() {
             local key="$1"
             local raw="$2"
-            python - "$key" "$raw" <<'PY'
-import json
-import sys
-key = sys.argv[1]
-raw = sys.argv[2]
-obj = json.loads(raw or "{}")
-val = obj.get(key)
-print("" if val is None else str(val))
-PY
+            python -c "import json,sys; obj=json.loads(sys.argv[2] or '{}'); v=obj.get(sys.argv[1]); print('' if v is None else str(v))" "$key" "$raw"
           }
 
           parse_asset_id_by_name() {
             local name="$1"
             local raw="$2"
-            python - "$name" "$raw" <<'PY'
-import json
-import sys
-target = sys.argv[1]
-raw = sys.argv[2]
-obj = json.loads(raw or "[]")
-if isinstance(obj, dict):
-    obj = obj.get("assets") or obj.get("attach_files") or []
-for item in obj or []:
-    if str(item.get("name") or "") == target:
-        print(item.get("id") or "")
-        break
-PY
+            python -c "import json,sys; target=sys.argv[1]; obj=json.loads(sys.argv[2] or '[]'); obj=(obj.get('assets') or obj.get('attach_files') or []) if isinstance(obj, dict) else obj; print(next((str(x.get('id') or '') for x in (obj or []) if str(x.get('name') or '')==target), ''))" "$name" "$raw"
           }
 
           # 1) resolve release id by tag; create if not exists
