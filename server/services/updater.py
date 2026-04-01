@@ -8,6 +8,7 @@ import ssl
 import subprocess
 import threading
 from datetime import datetime, timezone
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -31,19 +32,38 @@ def _is_newer(latest: str, current: str) -> bool:
     return _norm_ver(latest) > _norm_ver(current)
 
 
-def _github_json(url: str) -> dict[str, Any]:
+def _fetch_json(url: str, headers: dict[str, str] | None = None) -> dict[str, Any]:
     ctx = _ssl_context()
-    req = urllib.request.Request(
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else {}
+
+
+def _github_json(url: str) -> dict[str, Any]:
+    return _fetch_json(
         url,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": "nfa95-updater",
         },
     )
-    with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else {}
+
+
+def _append_query(url: str, params: dict[str, str]) -> str:
+    if not params:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{urllib.parse.urlencode(params)}"
+
+
+def _gitee_json(url: str, token: str | None = None) -> dict[str, Any]:
+    headers = {"User-Agent": "nfa95-updater"}
+    target_url = url
+    if token:
+        target_url = _append_query(url, {"access_token": token})
+    return _fetch_json(target_url, headers=headers)
 
 
 def _pick_asset_name() -> str:
@@ -53,35 +73,111 @@ def _pick_asset_name() -> str:
     return s.UPDATE_ASSET_LINUX or "nfa95"
 
 
-def check_update() -> dict[str, Any]:
-    s = get_settings()
-    current = s.APP_VERSION or "0.0.0"
-    repo = str(s.GITHUB_REPO or "").strip()
-    if not repo:
-        return {"ok": False, "message": "GITHUB_REPO is not configured", "current_version": current}
-    try:
-        data = _github_json(f"https://api.github.com/repos/{repo}/releases/latest")
-    except Exception as e:
-        msg = str(e)
-        if "CERTIFICATE_VERIFY_FAILED" in msg or "certificate verify failed" in msg.lower():
-            msg += " | hint: configure UPDATE_CA_BUNDLE or install CA certificates (temporary workaround: UPDATE_SKIP_TLS_VERIFY=true)"
-        return {"ok": False, "repo": repo, "current_version": current, "message": msg}
-    tag = str(data.get("tag_name") or "").strip()
-    assets = data.get("assets") or []
+def _parse_source_priority(raw: str) -> list[str]:
+    names = [str(x or "").strip().lower() for x in str(raw or "").split(",")]
+    allowed = {"gitee", "github"}
+    out: list[str] = []
+    for name in names:
+        if name in allowed and name not in out:
+            out.append(name)
+    if not out:
+        return ["gitee", "github"]
+    return out
+
+
+def _pick_asset(assets: Any, asset_name: str) -> dict[str, Any] | None:
     if not isinstance(assets, list):
-        assets = []
-    asset_name = _pick_asset_name()
-    asset = next((a for a in assets if str(a.get("name") or "") == asset_name), None)
+        return None
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").strip() == asset_name:
+            return item
+    return None
+
+
+def _asset_download_url(asset: dict[str, Any] | None) -> str | None:
+    if not isinstance(asset, dict):
+        return None
+    keys = ("browser_download_url", "download_url", "url")
+    for key in keys:
+        url = str(asset.get(key) or "").strip()
+        if url:
+            return url
+    return None
+
+
+def _check_update_from_github(current: str, repo: str, asset_name: str) -> dict[str, Any]:
+    data = _github_json(f"https://api.github.com/repos/{repo}/releases/latest")
+    tag = str(data.get("tag_name") or "").strip()
+    asset = _pick_asset(data.get("assets") or [], asset_name)
     return {
         "ok": True,
+        "source": "github",
         "repo": repo,
         "current_version": current,
         "latest_version": tag or "",
         "update_available": bool(tag and _is_newer(tag, current)),
         "published_at": data.get("published_at"),
         "asset_name": asset_name,
-        "asset_url": (asset or {}).get("browser_download_url"),
+        "asset_url": _asset_download_url(asset),
         "release_url": data.get("html_url"),
+    }
+
+
+def _check_update_from_gitee(current: str, repo: str, asset_name: str, token: str | None) -> dict[str, Any]:
+    data = _gitee_json(f"https://gitee.com/api/v5/repos/{repo}/releases/latest", token=token)
+    tag = str(data.get("tag_name") or "").strip()
+    asset = _pick_asset(data.get("assets") or [], asset_name)
+    return {
+        "ok": True,
+        "source": "gitee",
+        "repo": repo,
+        "current_version": current,
+        "latest_version": tag or "",
+        "update_available": bool(tag and _is_newer(tag, current)),
+        "published_at": data.get("published_at") or data.get("created_at"),
+        "asset_name": asset_name,
+        "asset_url": _asset_download_url(asset),
+        "release_url": data.get("html_url"),
+    }
+
+
+def check_update() -> dict[str, Any]:
+    s = get_settings()
+    current = s.APP_VERSION or "0.0.0"
+    asset_name = _pick_asset_name()
+    gitee_repo = str((getattr(s, "GITEE_REPO", None) or s.GITHUB_REPO or "")).strip()
+    github_repo = str(s.GITHUB_REPO or "").strip()
+    gitee_token = str(getattr(s, "GITEE_TOKEN", None) or "").strip() or None
+    source_priority = _parse_source_priority(str(getattr(s, "UPDATE_SOURCE_PRIORITY", "gitee,github")))
+
+    errors: list[str] = []
+    for source in source_priority:
+        try:
+            if source == "gitee":
+                if not gitee_repo:
+                    raise ValueError("GITEE_REPO/GITHUB_REPO is not configured")
+                return _check_update_from_gitee(current, gitee_repo, asset_name, gitee_token)
+            if source == "github":
+                if not github_repo:
+                    raise ValueError("GITHUB_REPO is not configured")
+                return _check_update_from_github(current, github_repo, asset_name)
+        except Exception as e:
+            msg = str(e)
+            if "CERTIFICATE_VERIFY_FAILED" in msg or "certificate verify failed" in msg.lower():
+                msg += " | hint: configure UPDATE_CA_BUNDLE or install CA certificates (temporary workaround: UPDATE_SKIP_TLS_VERIFY=true)"
+            errors.append(f"{source}: {msg}")
+
+    message = "all update sources failed"
+    if errors:
+        message = f"{message} | {'; '.join(errors)}"
+    return {
+        "ok": False,
+        "current_version": current,
+        "asset_name": asset_name,
+        "message": message,
+        "errors": errors,
     }
 
 
