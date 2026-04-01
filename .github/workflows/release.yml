@@ -125,8 +125,6 @@ jobs:
         shell: bash
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_OWNER: ${{ vars.GITEE_OWNER }}
-          GITEE_REPO: ${{ vars.GITEE_REPO }}
         run: |
           set -euo pipefail
           if [[ -z "${GITEE_TOKEN:-}" ]]; then
@@ -134,8 +132,8 @@ jobs:
             exit 0
           fi
           TAG_NAME="${GITHUB_REF_NAME}"
-          OWNER="${GITEE_OWNER:-${GITHUB_REPOSITORY_OWNER}}"
-          REPO="${GITEE_REPO:-${GITHUB_REPOSITORY#*/}}"
+          OWNER="ThinkHao"
+          REPO="nfatool"
           API_BASE="https://gitee.com/api/v5/repos/${OWNER}/${REPO}"
 
           echo "[gitee] target repo: ${OWNER}/${REPO}, tag: ${TAG_NAME}"
