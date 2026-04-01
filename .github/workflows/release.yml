@@ -119,3 +119,98 @@ jobs:
             server/.env.example
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync Gitee Release Assets
+        if: startsWith(github.ref, 'refs/tags/') && secrets.GITEE_TOKEN != ''
+        shell: bash
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          GITEE_OWNER: ${{ vars.GITEE_OWNER }}
+          GITEE_REPO: ${{ vars.GITEE_REPO }}
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          OWNER="${GITEE_OWNER:-${GITHUB_REPOSITORY_OWNER}}"
+          REPO="${GITEE_REPO:-${GITHUB_REPOSITORY#*/}}"
+          API_BASE="https://gitee.com/api/v5/repos/${OWNER}/${REPO}"
+
+          echo "[gitee] target repo: ${OWNER}/${REPO}, tag: ${TAG_NAME}"
+
+          parse_json_field() {
+            local key="$1"
+            local raw="$2"
+            python - "$key" "$raw" <<'PY'
+import json
+import sys
+key = sys.argv[1]
+raw = sys.argv[2]
+obj = json.loads(raw or "{}")
+val = obj.get(key)
+print("" if val is None else str(val))
+PY
+          }
+
+          parse_asset_id_by_name() {
+            local name="$1"
+            local raw="$2"
+            python - "$name" "$raw" <<'PY'
+import json
+import sys
+target = sys.argv[1]
+raw = sys.argv[2]
+obj = json.loads(raw or "[]")
+if isinstance(obj, dict):
+    obj = obj.get("assets") or obj.get("attach_files") or []
+for item in obj or []:
+    if str(item.get("name") or "") == target:
+        print(item.get("id") or "")
+        break
+PY
+          }
+
+          # 1) resolve release id by tag; create if not exists
+          release_resp="$(curl -sS -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
+          release_body="$(echo "${release_resp}" | sed '$d')"
+          release_code="$(echo "${release_resp}" | tail -n1)"
+
+          if [[ "${release_code}" == "200" ]]; then
+            release_id="$(parse_json_field id "${release_body}")"
+          elif [[ "${release_code}" == "404" ]]; then
+            create_resp="$(curl -sS -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
+              -d "access_token=${GITEE_TOKEN}" \
+              -d "tag_name=${TAG_NAME}" \
+              -d "name=${TAG_NAME}" \
+              -d "body=Synced from GitHub Actions run ${GITHUB_RUN_ID}")"
+            create_body="$(echo "${create_resp}" | sed '$d')"
+            create_code="$(echo "${create_resp}" | tail -n1)"
+            if [[ "${create_code}" != "201" && "${create_code}" != "200" ]]; then
+              echo "[gitee] create release failed: HTTP ${create_code}"
+              echo "${create_body}"
+              exit 1
+            fi
+            release_id="$(parse_json_field id "${create_body}")"
+          else
+            echo "[gitee] fetch release failed: HTTP ${release_code}"
+            echo "${release_body}"
+            exit 1
+          fi
+
+          if [[ -z "${release_id}" ]]; then
+            echo "[gitee] release id is empty"
+            exit 1
+          fi
+          echo "[gitee] release id: ${release_id}"
+
+          # 2) replace assets with same name, then upload new files
+          attach_list="$(curl -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
+          for file in artifacts/windows/nfa95.exe artifacts/linux/nfa95 server/.env.example; do
+            name="$(basename "${file}")"
+            existing_id="$(parse_asset_id_by_name "${name}" "${attach_list}")"
+            if [[ -n "${existing_id}" ]]; then
+              curl -sS -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
+            fi
+            curl -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+              -F "access_token=${GITEE_TOKEN}" \
+              -F "file=@${file}" >/dev/null
+            echo "[gitee] uploaded ${name}"
+          done
