@@ -31,10 +31,11 @@ from .config import (
     auto_rotate_data_source_key,
 )
 from .db import init_db, session_scope
-from .models import Task, JobRun
+from .models import Task, JobRun, TaskGroup
 from .schemas import (
     TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut,
     TaskBatchDelete, JobBatchDelete, JobBatchDownload,
+    TaskGroupCreate, TaskGroupRename, TaskGroupAssign,
     DataSourceInstancePayload, DataSourceTestPayload, DataSourceRotateKeyPayload, DataSourceRotatePolicyPayload, UpdateApplyPayload,
 )
 from .security import api_key_auth
@@ -111,6 +112,43 @@ def _get_next_run_time(task_id: int):
     except Exception:
         pass
     return None
+
+
+def _normalize_group_name(value: str | None) -> str | None:
+    if value is None:
+        return None
+    name = str(value).strip()
+    return name or None
+
+
+def _ensure_task_group_exists(s, group_name: str | None) -> None:
+    name = _normalize_group_name(group_name)
+    if not name:
+        return
+    row = s.query(TaskGroup).filter(TaskGroup.name == name).first()
+    if row:
+        return
+    s.add(TaskGroup(name=name))
+
+
+def _backfill_task_groups_from_tasks(s) -> None:
+    rows = (
+        s.query(Task.group_name)
+        .filter(Task.group_name.is_not(None))
+        .filter(Task.group_name != "")
+        .distinct()
+        .all()
+    )
+    names = [str(r[0]).strip() for r in rows if r and r[0] and str(r[0]).strip()]
+    if not names:
+        return
+    existing = {
+        str(x.name)
+        for x in s.query(TaskGroup).filter(TaskGroup.name.in_(names)).all()
+    }
+    for name in names:
+        if name not in existing:
+            s.add(TaskGroup(name=name))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -336,6 +374,7 @@ async def create_task(payload: TaskCreate):
             raise HTTPException(status_code=400, detail={"code": "TASK_NAME_DUPLICATE", "message": "任务名称已存在，请更换后重试"})
         t = Task(
             name=payload.name,
+            group_name=_normalize_group_name(payload.group_name),
             active=payload.active,
             kind=payload.kind,
             data_source_type=payload.data_source_type or "nfa",
@@ -350,6 +389,7 @@ async def create_task(payload: TaskCreate):
             export_formats=json.dumps(payload.export_formats or ["csv"], ensure_ascii=False),
             output_filename_template=payload.output_filename_template,
         )
+        _ensure_task_group_exists(s, t.group_name)
         s.add(t)
         s.flush()
         # (Re)schedule if periodic
@@ -368,6 +408,7 @@ async def create_task(payload: TaskCreate):
         return TaskOut(
             id=t.id,
             name=t.name,
+            group_name=t.group_name,
             active=t.active,
             kind=t.kind,
             data_source_type=t.data_source_type or "nfa",
@@ -397,6 +438,7 @@ async def list_tasks():
             out.append(TaskOut(
                 id=t.id,
                 name=t.name,
+                group_name=t.group_name,
                 active=t.active,
                 kind=t.kind,
                 data_source_type=t.data_source_type or "nfa",
@@ -416,6 +458,72 @@ async def list_tasks():
                 latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
             ))
         return out
+
+
+@app.get("/api/tasks/groups", dependencies=[Depends(api_key_auth)])
+async def list_task_groups():
+    with session_scope() as s:
+        _backfill_task_groups_from_tasks(s)
+        rows = s.query(TaskGroup).order_by(TaskGroup.name.asc()).all()
+        items = [str(r.name) for r in rows if r and r.name]
+        return {"items": items}
+
+
+@app.post("/api/tasks/groups", dependencies=[Depends(api_key_auth)])
+async def create_task_group(payload: TaskGroupCreate):
+    name = _normalize_group_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="group name is required")
+    with session_scope() as s:
+        dup = s.query(TaskGroup).filter(TaskGroup.name == name).first()
+        if dup:
+            raise HTTPException(status_code=409, detail={"code": "TASK_GROUP_DUPLICATE", "message": "分组名称已存在"})
+        s.add(TaskGroup(name=name))
+    return {"ok": True, "name": name}
+
+
+@app.patch("/api/tasks/groups/rename", dependencies=[Depends(api_key_auth)])
+async def rename_task_group(payload: TaskGroupRename):
+    old_name = _normalize_group_name(payload.old_name)
+    new_name = _normalize_group_name(payload.new_name)
+    if not old_name or not new_name:
+        raise HTTPException(status_code=400, detail="old_name and new_name are required")
+    if old_name == new_name:
+        return {"ok": True, "name": new_name, "updated_tasks": 0, "merged": False}
+    with session_scope() as s:
+        _backfill_task_groups_from_tasks(s)
+        old_group = s.query(TaskGroup).filter(TaskGroup.name == old_name).first()
+        old_count = s.query(Task).filter(Task.group_name == old_name).count()
+        if not old_group and old_count == 0:
+            raise HTTPException(status_code=404, detail="group not found")
+        target_group = s.query(TaskGroup).filter(TaskGroup.name == new_name).first()
+        merged = False
+        if target_group and not payload.merge:
+            raise HTTPException(status_code=409, detail={"code": "TASK_GROUP_DUPLICATE", "message": "目标分组已存在"})
+        if not target_group:
+            s.add(TaskGroup(name=new_name))
+        else:
+            merged = True
+        updated = s.query(Task).filter(Task.group_name == old_name).update({"group_name": new_name}, synchronize_session=False)
+        if old_group:
+            s.delete(old_group)
+    return {"ok": True, "name": new_name, "updated_tasks": int(updated or 0), "merged": merged}
+
+
+@app.delete("/api/tasks/groups", dependencies=[Depends(api_key_auth)])
+async def delete_task_group(name: str = Query(...)):
+    group_name = _normalize_group_name(name)
+    if not group_name:
+        raise HTTPException(status_code=400, detail="name is required")
+    with session_scope() as s:
+        _backfill_task_groups_from_tasks(s)
+        row = s.query(TaskGroup).filter(TaskGroup.name == group_name).first()
+        moved = s.query(Task).filter(Task.group_name == group_name).update({"group_name": None}, synchronize_session=False)
+        if row:
+            s.delete(row)
+        if not row and int(moved or 0) == 0:
+            raise HTTPException(status_code=404, detail="group not found")
+    return {"ok": True, "moved_tasks": int(moved or 0)}
 
 
 @app.get("/api/jobs/page", response_model=JobRunPageOut, dependencies=[Depends(api_key_auth)])
@@ -511,6 +619,8 @@ async def list_tasks_page(
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=200),
     q: Optional[str] = Query(default=None),
+    task_kind: Optional[str] = Query(default="all"),  # all|periodic|one_off
+    task_group: Optional[str] = Query(default=None),
     sort_by: Optional[str] = Query(default="id"),
     sort_order: Optional[str] = Query(default="desc")
 ):
@@ -522,6 +632,13 @@ async def list_tasks_page(
                 query = query.filter(Task.name.like(f"%{q}%"))
             except Exception:
                 pass
+        tk = (task_kind or "all").lower()
+        if tk in {"periodic", "one_off"}:
+            query = query.filter(Task.kind == tk)
+        if task_group:
+            tg = str(task_group).strip()
+            if tg:
+                query = query.filter(Task.group_name == tg)
         total = query.count()
         # sorting
         sort_field = (sort_by or "id").lower()
@@ -541,6 +658,7 @@ async def list_tasks_page(
             items.append(TaskOut(
                 id=t.id,
                 name=t.name,
+                group_name=t.group_name,
                 active=t.active,
                 kind=t.kind,
                 data_source_type=t.data_source_type or "nfa",
@@ -571,6 +689,7 @@ async def get_task(task_id: int):
         return TaskOut(
             id=t.id,
             name=t.name,
+            group_name=t.group_name,
             active=t.active,
             kind=t.kind,
             data_source_type=t.data_source_type or "nfa",
@@ -608,6 +727,9 @@ async def update_task(task_id: int, payload: TaskUpdate):
             data["params"] = json.dumps(data["params"], ensure_ascii=False)
         if "export_formats" in data and data["export_formats"] is not None:
             data["export_formats"] = json.dumps(data["export_formats"], ensure_ascii=False)
+        if "group_name" in data:
+            data["group_name"] = _normalize_group_name(data["group_name"])
+            _ensure_task_group_exists(s, data["group_name"])
         for k, v in data.items():
             setattr(t, k, v)
         s.add(t)
@@ -626,6 +748,7 @@ async def update_task(task_id: int, payload: TaskUpdate):
         return TaskOut(
             id=t.id,
             name=t.name,
+            group_name=t.group_name,
             active=t.active,
             kind=t.kind,
             data_source_type=t.data_source_type or "nfa",
@@ -644,6 +767,19 @@ async def update_task(task_id: int, payload: TaskUpdate):
             next_run_time=_get_next_run_time(t.id),
             latest_budget_summary=(json.loads(t.latest_budget_summary) if t.latest_budget_summary else None),
         )
+
+
+@app.patch("/api/tasks/{task_id}/group", dependencies=[Depends(api_key_auth)])
+async def patch_task_group(task_id: int, payload: TaskGroupAssign):
+    with session_scope() as s:
+        t = s.get(Task, task_id)
+        if not t:
+            raise HTTPException(status_code=404, detail="Task not found")
+        group_name = _normalize_group_name(payload.group_name)
+        _ensure_task_group_exists(s, group_name)
+        t.group_name = group_name
+        s.add(t)
+    return {"ok": True, "task_id": task_id, "group_name": group_name}
 
 
 @app.delete("/api/tasks/{task_id}", dependencies=[Depends(api_key_auth)])
@@ -841,7 +977,7 @@ async def batch_delete_jobs(payload: JobBatchDelete):
     return {"ok": True, "deleted": deleted}
 
 
-def _resolve_batch_download_files(payload: JobBatchDownload) -> tuple[list[tuple[str, Path]], str, str]:
+def _resolve_batch_download_files(payload: JobBatchDownload) -> tuple[list[tuple[str, str, Path]], str, str]:
     fmt = (payload.file_format or "csv").lower()
     if fmt not in {"all", "csv", "xlsx"}:
         fmt = "csv"
@@ -875,7 +1011,7 @@ def _resolve_batch_download_files(payload: JobBatchDownload) -> tuple[list[tuple
                     pass
         rows = q.order_by(JobRun.started_at.desc()).all()
 
-    files: list[tuple[str, Path]] = []
+    files: list[tuple[str, str, Path]] = []
     for r in rows:
         if r.status != "succeeded":
             continue
@@ -893,14 +1029,14 @@ def _resolve_batch_download_files(payload: JobBatchDownload) -> tuple[list[tuple
                 continue
             p = get_job_dir(r.id) / fn
             if p.exists() and p.is_file():
-                files.append((f"{r.id}/{fn}", p))
+                files.append((str(r.id), fn, p))
     return files, task_kind, fmt
 
 
 @app.post("/api/jobs/batch-download/preview", dependencies=[Depends(api_key_auth)])
 async def batch_download_preview(payload: JobBatchDownload):
     files, _, _ = _resolve_batch_download_files(payload)
-    run_ids = {str(arc).split("/", 1)[0] for arc, _ in files}
+    run_ids = {run_id for run_id, _, _ in files}
     return {"matched_runs": len(run_ids), "matched_files": len(files)}
 
 
@@ -917,8 +1053,24 @@ async def batch_download_jobs(payload: JobBatchDownload):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     zip_name = f"artifacts_{payload.month or 'all'}_{task_kind}_{fmt}_{ts}.zip"
     zip_path = dl_dir / zip_name
+    used_names: set[str] = set()
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for arc, p in files:
+        for run_id, filename, p in files:
+            arc = filename
+            if arc in used_names:
+                short_run_id = str(run_id)[:8]
+                arc = f"{short_run_id}_{filename}"
+                if arc in used_names:
+                    stem = Path(filename).stem
+                    suffix = Path(filename).suffix
+                    idx = 2
+                    while True:
+                        candidate = f"{short_run_id}_{stem}_{idx}{suffix}"
+                        if candidate not in used_names:
+                            arc = candidate
+                            break
+                        idx += 1
+            used_names.add(arc)
             zf.write(p, arcname=arc)
     return FileResponse(path=str(zip_path), filename=zip_name, media_type="application/zip")
 
