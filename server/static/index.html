@@ -213,6 +213,7 @@
         <h3>Step 1. 基础信息</h3>
         <div class="row">
           <input v-model.trim="newTask.name" placeholder="任务名" />
+          <input v-model.trim="newTask.group_name" placeholder="任务分组（可选）" />
           <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
           <label>
             数据源：
@@ -338,6 +339,7 @@
       <h2>编辑任务 #{{ editTask.id }}</h2>
       <div class="row">
         <input v-model.trim="editTask.name" placeholder="任务名" />
+        <input v-model.trim="editTask.group_name" placeholder="任务分组（可选）" />
         <label><input type="checkbox" v-model="editTask.active" /> 启用</label>
         <label>
           数据源：
@@ -426,11 +428,33 @@
           <div class="row">
             <button @click="loadTasks">刷新任务列表</button>
             <input v-model.trim="tasksQuery.q" placeholder="搜索任务名" />
+            <select v-model="tasksQuery.task_kind">
+              <option value="all">全部任务类型</option>
+              <option value="periodic">仅周期性</option>
+              <option value="one_off">仅一次性</option>
+            </select>
+            <select v-model="tasksQuery.task_group">
+              <option value="">全部分组</option>
+              <option v-for="g in taskGroups" :key="'tg-' + g" :value="g">{{ g }}</option>
+            </select>
             <button @click="applyTasksQuery">应用</button>
+            <button class="btn-muted" @click="clearTasksQuery">清空筛选</button>
             <button class="btn-muted" @click="selectAllTasksOnPage">本页全选</button>
             <button class="btn-muted" @click="clearTaskSelection">清空选择</button>
             <button @click="batchRunTasks">批量运行</button>
             <button class="btn-danger" @click="batchDeleteTasks">批量删除</button>
+          </div>
+          <div class="row">
+            <span class="hint">分组管理：</span>
+            <input v-model.trim="groupAdmin.new_name" placeholder="新分组名" />
+            <button class="btn-muted" @click="createTaskGroup">创建分组</button>
+            <select v-model="groupAdmin.selected_name" @change="onSelectGroupAdmin">
+              <option value="">选择分组</option>
+              <option v-for="g in taskGroups" :key="'admin-g-' + g" :value="g">{{ g }}</option>
+            </select>
+            <input v-model.trim="groupAdmin.rename_to" placeholder="重命名为" />
+            <button class="btn-muted" @click="renameTaskGroup">重命名</button>
+            <button class="btn-danger" @click="deleteTaskGroup">删除分组</button>
           </div>
         </div>
         <div class="list-wrap">
@@ -444,10 +468,22 @@
                 <span class="chip">#{{ t.id }}</span>
                 <span class="chip">{{ (t.data_source_type || 'nfa').toUpperCase() }}/{{ t.data_source_instance || 'default' }}</span>
                 <span class="chip">{{ t.kind === 'periodic' ? '周期性' : '一次性' }}</span>
+                <span class="chip" v-if="t.group_name">分组 {{ t.group_name }}</span>
                 <span class="chip">{{ t.active ? '已启用' : '已暂停' }}</span>
                 <span class="chip">窗口 {{ t.window_selector }}</span>
               </div>
               <div class="item-sub">调度：{{ scheduleSummary(t) }} | 下次：{{ formatDateTimeShort(t.next_run_time) }}</div>
+              <div class="item-sub">
+                分组：
+                <select
+                  :value="t.group_name || ''"
+                  :disabled="groupAssignSavingTaskId===Number(t.id)"
+                  @change="quickAssignTaskGroup(t, $event.target.value)"
+                >
+                  <option value="">未分组</option>
+                  <option v-for="g in taskGroups" :key="'card-g-' + t.id + '-' + g" :value="g">{{ g }}</option>
+                </select>
+              </div>
               <div class="budget-box" v-if="t.latest_budget_summary">
                 <div class="budget-title">预算结算（{{ t.latest_budget_summary.year_month || '-' }}）</div>
                 <div class="budget-grid">
