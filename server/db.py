@@ -36,12 +36,22 @@ def _migrate_sqlite():
                 cols = [row[1] for row in res.fetchall()]
                 if 'kind' not in cols:
                     conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN kind VARCHAR(20) DEFAULT 'one_off'")
+                if 'group_name' not in cols:
+                    conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN group_name VARCHAR(100)")
                 if 'data_source_type' not in cols:
                     conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN data_source_type VARCHAR(20) DEFAULT 'nfa'")
                 if 'data_source_instance' not in cols:
                     conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN data_source_instance VARCHAR(100)")
                 if 'latest_budget_summary' not in cols:
                     conn.exec_driver_sql("ALTER TABLE tasks ADD COLUMN latest_budget_summary TEXT")
+                conn.exec_driver_sql("""
+                    CREATE TABLE IF NOT EXISTS task_groups (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name VARCHAR(100) NOT NULL UNIQUE,
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
                 res2 = conn.exec_driver_sql("PRAGMA table_info('job_runs')")
                 job_cols = [row[1] for row in res2.fetchall()]
                 if 'progress_pct' not in job_cols:
@@ -86,8 +96,17 @@ def _migrate_sqlite():
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_job_runs_task_id ON job_runs (task_id)")
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_job_runs_started_at ON job_runs (started_at)")
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_tasks_name ON tasks (name)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_tasks_group_name ON tasks (group_name)")
+                conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_groups_name ON task_groups (name)")
                 conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_data_source_configs_st_inst ON data_source_configs (source_type, instance)")
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_data_source_audit_created_at ON data_source_config_audit (created_at)")
+                # Backfill task_groups from historical task.group_name values.
+                conn.exec_driver_sql("""
+                    INSERT OR IGNORE INTO task_groups (name, created_at, updated_at)
+                    SELECT TRIM(group_name), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+                    FROM tasks
+                    WHERE group_name IS NOT NULL AND TRIM(group_name) != ''
+                """)
     except Exception:
         # Best-effort; ignore migration errors to avoid blocking startup
         pass
