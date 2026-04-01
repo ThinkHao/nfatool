@@ -9,11 +9,21 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
 
+class TaskGroup(Base):
+    __tablename__ = "task_groups"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Task(Base):
     __tablename__ = "tasks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    group_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     kind: Mapped[Optional[str]] = mapped_column(String(20), default="one_off")
     data_source_type: Mapped[str] = mapped_column(String(20), default="nfa")
