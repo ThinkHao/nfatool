@@ -121,12 +121,15 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync Gitee Release Assets
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_REF:-}" != refs/tags/* ]]; then
+            echo "[gitee] not a tag push, skip syncing."
+            exit 0
+          fi
           if [[ -z "${GITEE_TOKEN:-}" ]]; then
             echo "[gitee] GITEE_TOKEN is empty, skip syncing."
             exit 0
