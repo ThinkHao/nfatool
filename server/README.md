@@ -178,6 +178,28 @@ python server/scripts/sync_gitee_release_assets.py --tag v2026.04.02-gitee-sync-
 - `--gitee-repo owner/repo`（默认跟随 GitHub 仓库名）
 - `--asset nfa95 --asset nfa95.exe --asset .env.example`（默认同步这三个）
 
+### 通过 Codex Skill 一条龙发版（推荐）
+
+已支持本地个人 skill：`nfatool-release`（存放在本机 `~/.codex/skills`，不进入仓库）。
+
+建议在发布时直接使用如下口令：
+
+- `按 nfatool-release 流程发布 v2026.04.02-fix1`
+- 或 `按 nfatool-release 流程发布最新版本（自动生成 tag）`
+
+该 skill 会执行以下流程：
+
+1. 预检工作区、remote、`GITEE_TOKEN`（仅读系统环境变量，不写入 `.env`）
+2. 打 tag 并推送，触发 GitHub `Release Executables`
+3. 轮询构建结果并读取 release 资产
+4. 若 Gitee 同步失败/超时，自动调用 `server/scripts/sync_gitee_release_assets.py --tag <tag>` 兜底补传
+5. 返回结构化发布摘要（GitHub/Gitee 链接、资产校验、可重试命令）
+
+注意：
+
+- Gitee 同步失败不会阻塞主发布（主发布结果以 GitHub 构建为准）。
+- 严禁把 token 写入仓库内任何 `.env`、脚本或提交记录。
+
 备注：
 
 - 前端静态文件和 `mapping.json` 会随可执行文件一同打包；若需要覆盖，可将 `mapping.json` 放在 exe 同级目录。
