@@ -102,6 +102,14 @@ MYSQL_DB=database
 Linux 生产环境建议使用“外部升级脚本”模式（更稳健，支持失败回滚）：
 
 1. 将 `server/scripts/nfa95-update.sh` 部署到服务器，例如 `/home/nfa95/bin/nfa95-update.sh`，并授予执行权限。
+   若服务以 `nfa95` 用户运行，需要额外配置免密 sudo（否则会出现 `Interactive authentication required`）：
+   ```bash
+   sudo install -m 440 server/scripts/nfa95-updater.sudoers /etc/sudoers.d/nfa95-updater
+   sudo visudo -cf /etc/sudoers.d/nfa95-updater
+   ```
+   同时请确认 systemd 单元满足以下两点（可直接使用仓库里的 `server/scripts/nfa95.service` 模板）：
+   - `NoNewPrivileges=false`（允许 `sudo -n systemctl restart`）
+   - `KillMode=process`（避免服务重启时连带杀死 updater，导致健康检查/回滚中断）
 2. 在 `.env` 配置：
 ```
 UPDATE_EXTERNAL_SCRIPT=/home/nfa95/bin/nfa95-update.sh
@@ -116,9 +124,42 @@ UPDATE_DOWNLOAD_RETRY=8
 UPDATE_DOWNLOAD_RETRY_DELAY_SEC=3
 UPDATE_DOWNLOAD_LOW_SPEED_TIME_SEC=30
 UPDATE_DOWNLOAD_LOW_SPEED_LIMIT_BPS=10240
+# 更新源优先级（默认 gitee,github）
+UPDATE_SOURCE_PRIORITY=gitee,github
+# GitHub 仓库（owner/repo）
+GITHUB_REPO=ThinkHao/nfatool
+# Gitee 仓库（owner/repo）；为空时回退使用 GITHUB_REPO
+GITEE_REPO=ThinkHao/nfatool
+# 私有 Gitee 仓库可配置 token（公开仓可不填）
+# GITEE_TOKEN=
 ```
 3. Web 点击“一键升级”后，后端会触发外部脚本执行两阶段切换与健康检查；失败将自动回滚并重启旧版本。
 4. 可通过 `GET /api/meta/update/status` 查看升级状态（running/succeeded/failed）和失败原因。
+
+## 双仓提交与发版建议
+
+推荐本地配置两个 remote：
+
+```bash
+git remote rename origin github
+git remote add origin https://github.com/ThinkHao/nfatool.git
+git remote add gitee https://gitee.com/ThinkHao/nfatool.git
+```
+
+常用推送（分支 + tag）：
+
+```bash
+git push origin <branch>
+git push gitee <branch>
+git push origin <tag>
+git push gitee <tag>
+```
+
+发版前检查清单：
+
+1. 同一 tag 在 GitHub 与 Gitee 均可见。
+2. Gitee Release 已上传 `nfa95` 与 `nfa95.exe` 产物。
+3. 应用端 `GET /api/meta/update` 返回 `source=gitee` 且 `asset_url` 非空。
 
 备注：
 

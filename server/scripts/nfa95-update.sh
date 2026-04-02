@@ -61,6 +61,24 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 2
 fi
 
+restart_service() {
+  local svc="${1:-}"
+  if [[ -z "$svc" ]]; then
+    echo "[ERR] restart_service requires service name" >&2
+    return 2
+  fi
+  if [[ "$(id -u)" -eq 0 ]]; then
+    systemctl restart "$svc"
+    return $?
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n systemctl restart "$svc"
+    return $?
+  fi
+  echo "[ERR] restart service requires root or passwordless sudo for systemctl" >&2
+  return 1
+}
+
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
 write_state() {
@@ -190,11 +208,12 @@ fi
 
 echo "[INFO] restarting service $SERVICE"
 write_state "running" "restart" "restarting service"
-if ! systemctl restart "$SERVICE"; then
+if ! restart_service "$SERVICE"; then
+  echo "[ERR] restart failed (need root or sudo NOPASSWD; check NoNewPrivileges=false), rolling back"
   echo "[ERR] restart failed, rolling back"
   ln -sfn "$OLD_RESOLVED" "$TMP_LINK"
   mv -Tf "$TMP_LINK" "$TARGET"
-  systemctl restart "$SERVICE" || true
+  restart_service "$SERVICE" || true
   FINAL_STATE="failed"
   write_state "failed" "restart" "restart failed; rollback attempted"
   exit 5
@@ -220,8 +239,8 @@ fi
 echo "[ERR] health check failed, rolling back to $OLD_RESOLVED"
 ln -sfn "$OLD_RESOLVED" "$TMP_LINK"
 mv -Tf "$TMP_LINK" "$TARGET"
-if ! systemctl restart "$SERVICE"; then
-  echo "[ERR] rollback restart failed; manual intervention required" >&2
+if ! restart_service "$SERVICE"; then
+  echo "[ERR] rollback restart failed; manual intervention required (check sudoers/NoNewPrivileges)" >&2
   FINAL_STATE="failed"
   write_state "failed" "rollback" "rollback restart failed; manual intervention required"
   exit 6
