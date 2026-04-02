@@ -121,6 +121,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync Gitee Release Assets
+        timeout-minutes: 8
         shell: bash
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -138,6 +139,7 @@ jobs:
           OWNER="ThinkHao"
           REPO="nfatool"
           API_BASE="https://gitee.com/api/v5/repos/${OWNER}/${REPO}"
+          CURL_OPTS=(--connect-timeout 15 --max-time 180 --retry 3 --retry-delay 2 --retry-connrefused)
 
           echo "[gitee] target repo: ${OWNER}/${REPO}, tag: ${TAG_NAME}"
 
@@ -154,7 +156,7 @@ jobs:
           }
 
           # 1) resolve release id by tag; create if not exists
-          release_resp="$(curl -sS -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
+          release_resp="$(curl "${CURL_OPTS[@]}" -sS -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
           release_body="$(echo "${release_resp}" | sed '$d')"
           release_code="$(echo "${release_resp}" | tail -n1)"
           release_id=""
@@ -171,7 +173,7 @@ jobs:
 
           if [[ -z "${release_id}" ]]; then
             echo "[gitee] release not found by tag, creating one..."
-            create_resp="$(curl -sS -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
+            create_resp="$(curl "${CURL_OPTS[@]}" -sS -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
               -d "tag_name=${TAG_NAME}" \
               -d "target_commitish=main" \
@@ -194,14 +196,14 @@ jobs:
           echo "[gitee] release id: ${release_id}"
 
           # 2) replace assets with same name, then upload new files
-          attach_list="$(curl -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
+          attach_list="$(curl "${CURL_OPTS[@]}" -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
           for file in artifacts/windows/nfa95.exe artifacts/linux/nfa95 server/.env.example; do
             name="$(basename "${file}")"
             existing_id="$(parse_asset_id_by_name "${name}" "${attach_list}")"
             if [[ -n "${existing_id}" ]]; then
-              curl -sS -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
+              curl "${CURL_OPTS[@]}" -sS -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
             fi
-            curl -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+            curl "${CURL_OPTS[@]}" -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
               -F "access_token=${GITEE_TOKEN}" \
               -F "file=@${file}" >/dev/null
             echo "[gitee] uploaded ${name}"
