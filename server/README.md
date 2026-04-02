@@ -161,6 +161,23 @@ git push gitee <tag>
 2. Gitee Release 已上传 `nfa95` 与 `nfa95.exe` 产物。
 3. 应用端 `GET /api/meta/update` 返回 `source=gitee` 且 `asset_url` 非空。
 
+若 GitHub Action 受网络影响未能完成 Gitee 附件上传，可在本地执行一次补传脚本：
+
+```bash
+# 先设置 Gitee token（不要写入仓库内 .env）
+export GITEE_TOKEN=xxxx
+# Windows PowerShell:
+# $env:GITEE_TOKEN="xxxx"
+
+python server/scripts/sync_gitee_release_assets.py --tag v2026.04.02-gitee-sync-nonblock-fix1
+```
+
+可选参数：
+
+- `--github-repo owner/repo`（默认 `ThinkHao/nfatool`）
+- `--gitee-repo owner/repo`（默认跟随 GitHub 仓库名）
+- `--asset nfa95 --asset nfa95.exe --asset .env.example`（默认同步这三个）
+
 备注：
 
 - 前端静态文件和 `mapping.json` 会随可执行文件一同打包；若需要覆盖，可将 `mapping.json` 放在 exe 同级目录。
