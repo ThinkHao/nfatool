@@ -1,0 +1,6 @@
+# Allow nfa95 updater to restart the service without interactive password.
+# Install as /etc/sudoers.d/nfa95-updater and validate with:
+#   visudo -cf /etc/sudoers.d/nfa95-updater
+#
+# Adjust service name if your deployment uses a different unit.
+nfa95 ALL=(root) NOPASSWD: /usr/bin/systemctl restart nfa95.service

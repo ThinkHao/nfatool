@@ -18,6 +18,27 @@ from ..config import get_settings
 _APPLY_GUARD = threading.Lock()
 
 
+def _resolve_update_target() -> Path:
+    # Prefer argv[0] so updates keep using the stable launch path (for example
+    # /home/nfa95/nfa95 symlink), instead of resolving into nested release dirs.
+    argv0 = str((getattr(os.sys, "argv", None) or [""])[0] or "").strip()
+    candidates: list[Path] = []
+    if argv0:
+        candidates.append(Path(os.path.abspath(argv0)))
+    exe = str(getattr(os.sys, "executable", "") or "").strip()
+    if exe:
+        candidates.append(Path(os.path.abspath(exe)))
+    for p in candidates:
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            continue
+    if candidates:
+        return candidates[0]
+    return Path(os.path.abspath("nfa95"))
+
+
 def _norm_ver(v: str) -> tuple[int, ...]:
     s = str(v or "").strip()
     if s.startswith("v"):
@@ -277,7 +298,7 @@ def _is_state_stale_running(state: dict[str, Any], stale_sec: int) -> bool:
 
 def get_update_status() -> dict[str, Any]:
     s = get_settings()
-    target = Path(os.path.realpath(os.sys.executable))
+    target = _resolve_update_target()
     state_path = _resolve_runner_state(s, target)
     log_path = _resolve_runner_log(s, target)
     st = _read_runner_state(state_path)
@@ -315,7 +336,7 @@ def _apply_update_external(info: dict[str, Any], restart_after_update: bool) -> 
     if not script.exists():
         raise ValueError(f"external updater script not found: {script}")
 
-    target = Path(os.path.realpath(os.sys.executable))
+    target = _resolve_update_target()
     if not target.exists():
         raise ValueError("executable path not found")
 
@@ -429,7 +450,7 @@ def apply_update(restart_after_update: bool = True) -> dict[str, Any]:
         if platform.system().lower().startswith("linux") and str(s.UPDATE_EXTERNAL_SCRIPT or "").strip():
             state = get_update_status()
             if _is_state_stale_running(state, int(getattr(s, "UPDATE_STATUS_STALE_SEC", 7200) or 7200)):
-                target = Path(os.path.realpath(os.sys.executable))
+                target = _resolve_update_target()
                 state_path = _resolve_runner_state(s, target)
                 _write_runner_state(state_path, {
                     "status": "failed",
@@ -451,7 +472,7 @@ def apply_update(restart_after_update: bool = True) -> dict[str, Any]:
         url = str(info.get("asset_url") or "").strip()
         if not url:
             raise ValueError(f"release asset not found: {info.get('asset_name')}")
-        target = Path(os.path.realpath(os.sys.executable))
+        target = _resolve_update_target()
         if not target.exists():
             raise ValueError("executable path not found")
         state_path = _resolve_runner_state(s, target)

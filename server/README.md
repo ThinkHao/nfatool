@@ -102,6 +102,14 @@ MYSQL_DB=database
 Linux 生产环境建议使用“外部升级脚本”模式（更稳健，支持失败回滚）：
 
 1. 将 `server/scripts/nfa95-update.sh` 部署到服务器，例如 `/home/nfa95/bin/nfa95-update.sh`，并授予执行权限。
+   若服务以 `nfa95` 用户运行，需要额外配置免密 sudo（否则会出现 `Interactive authentication required`）：
+   ```bash
+   sudo install -m 440 server/scripts/nfa95-updater.sudoers /etc/sudoers.d/nfa95-updater
+   sudo visudo -cf /etc/sudoers.d/nfa95-updater
+   ```
+   同时请确认 systemd 单元满足以下两点（可直接使用仓库里的 `server/scripts/nfa95.service` 模板）：
+   - `NoNewPrivileges=false`（允许 `sudo -n systemctl restart`）
+   - `KillMode=process`（避免服务重启时连带杀死 updater，导致健康检查/回滚中断）
 2. 在 `.env` 配置：
 ```
 UPDATE_EXTERNAL_SCRIPT=/home/nfa95/bin/nfa95-update.sh

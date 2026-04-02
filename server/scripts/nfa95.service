@@ -24,9 +24,12 @@ TimeoutStopSec=30
 # 自动重启策略
 Restart=on-failure
 RestartSec=5s
+# 允许 updater 子进程在服务重启时继续运行，完成健康检查/回滚逻辑
+KillMode=process
 
 # 资源与安全（可按需调整）
-NoNewPrivileges=true
+# 说明：外部升级脚本需要通过 sudo -n 重启服务，因此这里不能启用 NoNewPrivileges。
+NoNewPrivileges=false
 LimitNOFILE=65536
 PrivateTmp=true
 
