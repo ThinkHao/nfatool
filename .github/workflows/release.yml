@@ -141,6 +141,7 @@ jobs:
           API_BASE="https://gitee.com/api/v5/repos/${OWNER}/${REPO}"
           API_CURL_OPTS=(--connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 --retry-connrefused)
           UPLOAD_CURL_OPTS=(--connect-timeout 20 --max-time 600 --retry 5 --retry-delay 3 --retry-connrefused --retry-all-errors)
+          UPLOAD_CURL_OPTS_EXE=(--connect-timeout 20 --max-time 180 --retry 1 --retry-delay 2 --retry-connrefused --retry-all-errors)
 
           echo "[gitee] target repo: ${OWNER}/${REPO}, tag: ${TAG_NAME}"
 
@@ -150,6 +151,10 @@ jobs:
 
           curl_upload() {
             curl "${UPLOAD_CURL_OPTS[@]}" -sS "$@"
+          }
+
+          curl_upload_exe() {
+            curl "${UPLOAD_CURL_OPTS_EXE[@]}" -sS "$@"
           }
 
           parse_json_field() {
@@ -207,7 +212,7 @@ jobs:
           # 2) replace assets with same name, then upload new files
           echo "[gitee] fetch existing assets list..."
           attach_list="$(curl_api "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
-          for file in artifacts/windows/nfa95.exe artifacts/linux/nfa95 server/.env.example; do
+          for file in artifacts/linux/nfa95 server/.env.example artifacts/windows/nfa95.exe; do
             name="$(basename "${file}")"
             echo "[gitee] syncing asset: ${name}"
             existing_id="$(parse_asset_id_by_name "${name}" "${attach_list}")"
@@ -216,9 +221,19 @@ jobs:
               curl_api -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
             fi
             echo "[gitee] uploading ${name} ..."
-            curl_upload -X POST "${API_BASE}/releases/${release_id}/attach_files" \
-              -H "Expect:" \
-              -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${file}" >/dev/null
+            if [[ "${name}" == "nfa95.exe" ]]; then
+              if ! curl_upload_exe -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+                -H "Expect:" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${file}" >/dev/null; then
+                echo "[gitee] WARN: upload ${name} failed; continue without blocking release."
+                continue
+              fi
+            else
+              curl_upload -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+                -H "Expect:" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${file}" >/dev/null
+            fi
             echo "[gitee] uploaded ${name}"
           done
