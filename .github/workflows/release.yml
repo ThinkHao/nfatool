@@ -217,6 +217,7 @@ jobs:
             fi
             echo "[gitee] uploading ${name} ..."
             curl_upload -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+              -H "Expect:" \
               -F "access_token=${GITEE_TOKEN}" \
               -F "file=@${file}" >/dev/null
             echo "[gitee] uploaded ${name}"
