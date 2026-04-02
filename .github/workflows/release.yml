@@ -157,10 +157,20 @@ jobs:
           release_resp="$(curl -sS -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
           release_body="$(echo "${release_resp}" | sed '$d')"
           release_code="$(echo "${release_resp}" | tail -n1)"
+          release_id=""
 
           if [[ "${release_code}" == "200" ]]; then
             release_id="$(parse_json_field id "${release_body}")"
           elif [[ "${release_code}" == "404" ]]; then
+            release_id=""
+          else
+            echo "[gitee] fetch release failed: HTTP ${release_code}"
+            echo "${release_body}"
+            exit 1
+          fi
+
+          if [[ -z "${release_id}" ]]; then
+            echo "[gitee] release not found by tag, creating one..."
             create_resp="$(curl -sS -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
               -d "tag_name=${TAG_NAME}" \
@@ -174,10 +184,6 @@ jobs:
               exit 1
             fi
             release_id="$(parse_json_field id "${create_body}")"
-          else
-            echo "[gitee] fetch release failed: HTTP ${release_code}"
-            echo "${release_body}"
-            exit 1
           fi
 
           if [[ -z "${release_id}" ]]; then
