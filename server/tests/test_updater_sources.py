@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 
@@ -47,6 +48,7 @@ def test_check_update_prefers_gitee(monkeypatch):
     assert out["ok"] is True
     assert out["source"] == "gitee"
     assert out["latest_version"] == "v0.2.0"
+    assert out["current_version_source"] == "env_app_version"
 
 
 def test_check_update_fallback_to_github(monkeypatch):
@@ -111,3 +113,43 @@ def test_apply_update_requires_asset_url(monkeypatch):
 
     with pytest.raises(ValueError, match="release asset not found"):
         updater.apply_update()
+
+
+def test_resolve_current_version_prefers_state(monkeypatch):
+    monkeypatch.setattr(updater, "get_settings", lambda: _settings(APP_VERSION="v0.1.0"))
+    monkeypatch.setattr(updater, "_resolve_current_version_from_state", lambda: "v2026.04.02")
+    monkeypatch.setattr(updater, "_resolve_current_version_from_target_path", lambda: "v2026.04.01")
+
+    ver, source = updater._resolve_current_version()
+    assert ver == "v2026.04.02"
+    assert source == "state_file"
+
+
+def test_resolve_current_version_fallback_to_target_path(monkeypatch):
+    monkeypatch.setattr(updater, "get_settings", lambda: _settings(APP_VERSION="v0.1.0"))
+    monkeypatch.setattr(updater, "_resolve_current_version_from_state", lambda: None)
+    monkeypatch.setattr(updater, "_resolve_current_version_from_target_path", lambda: "v2026.04.01")
+
+    ver, source = updater._resolve_current_version()
+    assert ver == "v2026.04.01"
+    assert source == "target_path"
+
+
+def test_resolve_current_version_fallback_to_env(monkeypatch):
+    monkeypatch.setattr(updater, "get_settings", lambda: _settings(APP_VERSION="v0.1.0"))
+    monkeypatch.setattr(updater, "_resolve_current_version_from_state", lambda: None)
+    monkeypatch.setattr(updater, "_resolve_current_version_from_target_path", lambda: None)
+
+    ver, source = updater._resolve_current_version()
+    assert ver == "v0.1.0"
+    assert source == "env_app_version"
+
+
+def test_resolve_current_version_from_target_path_parses_release_chain(monkeypatch):
+    monkeypatch.setattr(
+        updater,
+        "_resolve_update_target",
+        lambda: Path("/home/nfa95/releases/v2026.04.02-gitee-sync-nonblock-fix1-20260402165611/nfa95"),
+    )
+    out = updater._resolve_current_version_from_target_path()
+    assert out == "v2026.04.02-gitee-sync-nonblock-fix1"
