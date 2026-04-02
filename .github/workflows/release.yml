@@ -121,7 +121,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync Gitee Release Assets
-        timeout-minutes: 20
+        id: sync_gitee_release_assets
+        timeout-minutes: 6
+        continue-on-error: true
         shell: bash
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
@@ -237,3 +239,13 @@ jobs:
             fi
             echo "[gitee] uploaded ${name}"
           done
+
+      - name: Gitee Sync Summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.sync_gitee_release_assets.outcome }}" == "success" ]]; then
+            echo "[gitee] sync step succeeded."
+          else
+            echo "[gitee] WARN: sync step failed or timed out; GitHub release is still available."
+          fi
