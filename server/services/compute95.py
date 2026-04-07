@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 from pathlib import Path as _Path
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +20,8 @@ from ..config import get_data_source_instances
 from .exporter import export_csv, export_xlsx
 from .storage import get_job_dir, safe_artifact_path
 from .unit_conversion import mbps_to_raw, raw_to_mbps
+
+logger = logging.getLogger(__name__)
 
 
 def _as_bool(v: Any) -> bool:
@@ -281,6 +284,125 @@ def _pick_daily_95_from_rows(rows: list[dict], rank_index: int) -> tuple[float, 
     return vals[idx], len(vals)
 
 
+def _normalize_nfa_targets(targets: List[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for it in targets or []:
+        if isinstance(it, dict):
+            ipg = it.get("ipgroup_id")
+            uid = it.get("nfa_uuid")
+            h = it.get("hash_uuid")
+        elif isinstance(it, (list, tuple)) and len(it) >= 2:
+            ipg = it[0]
+            uid = it[1]
+            h = it[2] if len(it) >= 3 else None
+        else:
+            continue
+        if ipg is None or uid is None:
+            continue
+        out.append({"ipgroup_id": ipg, "nfa_uuid": uid, "hash_uuid": h})
+    return out
+
+
+def _infer_query_path(targets: List[Any]) -> str:
+    norm = _normalize_nfa_targets(targets)
+    if not norm:
+        return "none"
+    total = len(norm)
+    with_hash = sum(1 for t in norm if t.get("hash_uuid"))
+    if with_hash == 0:
+        return "pair_fallback"
+    if with_hash == total:
+        return "hash_uuid"
+    return "hash_uuid+pair_fallback"
+
+
+def _classify_query_error(exc: Exception) -> str:
+    text = str(exc or "").lower()
+    timeout_markers = ("timeout", "timed out", "read timeout", "lock wait timeout")
+    return "QUERY_TIMEOUT" if any(m in text for m in timeout_markers) else "QUERY_FAILED"
+
+
+def _nfa_has_any_raw_points(
+    conn,
+    targets: List[Any],
+    start_time: str,
+    end_time: str,
+    sample_pairs: int = 8,
+) -> Dict[str, Any]:
+    """Best-effort probe for raw 5-minute points in window.
+
+    This is used only as a guard against false "no data" caused by query failures
+    in batched aggregation paths.
+    """
+    norm = _normalize_nfa_targets(targets)
+    if not norm:
+        return {"has_points": False, "query_path": "none", "query_elapsed_ms": 0}
+
+    picked = norm[: max(1, int(sample_pairs))]
+    with_hash = [x for x in picked if x.get("hash_uuid")]
+    without_hash = [x for x in picked if not x.get("hash_uuid")]
+    used_hash = False
+    used_pair = False
+    t0 = time.monotonic()
+
+    if with_hash:
+        placeholders = ", ".join(["%s"] * len(with_hash))
+        sql = f"""
+            SELECT 1
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND hash_uuid IN ({placeholders})
+            LIMIT 1
+        """
+        params: List[Any] = [start_time, end_time] + [x["hash_uuid"] for x in with_hash]
+        with conn.cursor() as cursor:
+            cursor.execute(sql, tuple(params))
+            row = cursor.fetchone()
+        used_hash = True
+        if row:
+            return {
+                "has_points": True,
+                "query_path": "hash_uuid" if not without_hash else "hash_uuid+pair_fallback",
+                "query_elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }
+
+    if without_hash:
+        placeholders = ", ".join(["(%s, %s)"] * len(without_hash))
+        sql = f"""
+            SELECT 1
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND (ipgroup_id, nfa_uuid) IN ({placeholders})
+            LIMIT 1
+        """
+        params = [start_time, end_time]
+        for item in without_hash:
+            params.extend([item["ipgroup_id"], item["nfa_uuid"]])
+        with conn.cursor() as cursor:
+            cursor.execute(sql, tuple(params))
+            row = cursor.fetchone()
+        used_pair = True
+        if row:
+            return {
+                "has_points": True,
+                "query_path": "pair_fallback" if not used_hash else "hash_uuid+pair_fallback",
+                "query_elapsed_ms": int((time.monotonic() - t0) * 1000),
+            }
+
+    query_path = "none"
+    if used_hash and used_pair:
+        query_path = "hash_uuid+pair_fallback"
+    elif used_hash:
+        query_path = "hash_uuid"
+    elif used_pair:
+        query_path = "pair_fallback"
+    return {
+        "has_points": False,
+        "query_path": query_path,
+        "query_elapsed_ms": int((time.monotonic() - t0) * 1000),
+    }
+
+
 def _compute_edc_and_export(
     job_id: str,
     resolved_window: Dict[str, Any],
@@ -370,7 +492,21 @@ def _compute_edc_and_export(
         if not full_rows:
             reason = f"EDC 无匹配数据：模式={edc_name}，时间范围={st:%Y-%m-%d}~{et:%Y-%m-%d}"
             _progress(progress_cb, 92, "EDC: 无匹配数据，正在结束任务")
-            return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
+            return _make_terminal_no_data_artifacts(
+                job_id,
+                base_name,
+                reason,
+                source_type="edc",
+                source_instance=source_instance,
+                resolved_window=resolved_window,
+                key_params={
+                    "edc_name": edc_name,
+                    "wildcard_mode": wildcard_mode,
+                    "exclude_like": exclude_like,
+                    "rank_index": rank_index,
+                },
+                counters={"daily_days": len(daily_rows), "full_rows": 0},
+            )
         range_raw, _range_points = _pick_daily_95_from_rows(full_rows, rank_index)
 
         # Optional "data budget" summary: convert raw settlement by custom formula.
@@ -483,14 +619,40 @@ def _compute_edc_and_export(
             elif "month" in dfm.columns:
                 dfm = dfm.sort_values(by="month", ascending=True, kind="stable")
             _progress(progress_cb, 92, "EDC: 正在导出按月产物")
-            return _export_df(dfm, job_id, f"{base_name}-monthly", export_formats)
+            return _export_df(
+                dfm,
+                job_id,
+                f"{base_name}-monthly",
+                export_formats,
+                empty_terminal={
+                    "reason": f"EDC 按月聚合结果为空：模式={edc_name}，窗口={window_label}",
+                    "source_type": "edc",
+                    "source_instance": source_instance,
+                    "resolved_window": resolved_window,
+                    "key_params": {"edc_name": edc_name, "monthly_aggregate": True},
+                    "counters": {"months": len(month_ranges)},
+                },
+            )
 
         if export_daily:
             df = pd.DataFrame(daily_rows)
             if sortby and sortby in df.columns:
                 df = df.sort_values(by=sortby, ascending=(sort_order == "asc"))
             _progress(progress_cb, 92, "EDC: 正在导出产物")
-            return _export_df(df, job_id, base_name, export_formats)
+            return _export_df(
+                df,
+                job_id,
+                base_name,
+                export_formats,
+                empty_terminal={
+                    "reason": f"EDC 每日导出结果为空：模式={edc_name}，窗口={window_label}",
+                    "source_type": "edc",
+                    "source_instance": source_instance,
+                    "resolved_window": resolved_window,
+                    "key_params": {"edc_name": edc_name, "export_daily": True},
+                    "counters": {"daily_days": len(daily_rows)},
+                },
+            )
 
         if settlement_mode == "daily_95_avg":
             daily_series = pd.Series([float(r["daily_95th_percentile_mbps"]) for r in daily_rows])
@@ -513,7 +675,20 @@ def _compute_edc_and_export(
         if sortby and sortby in df.columns:
             df = df.sort_values(by=sortby, ascending=(sort_order == "asc"))
         _progress(progress_cb, 92, "EDC: 正在导出产物")
-        return _export_df(df, job_id, base_name, export_formats)
+        return _export_df(
+            df,
+            job_id,
+            base_name,
+            export_formats,
+            empty_terminal={
+                "reason": f"EDC 汇总结果为空：模式={edc_name}，窗口={window_label}",
+                "source_type": "edc",
+                "source_instance": source_instance,
+                "resolved_window": resolved_window,
+                "key_params": {"edc_name": edc_name, "settlement_mode": settlement_mode},
+                "counters": {"full_rows": len(full_rows)},
+            },
+        )
     finally:
         try:
             conn.close()
@@ -541,7 +716,86 @@ def _progress(progress_cb: Callable[[int, str], None] | None, pct: int, stage: s
         pass
 
 
-def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_formats: List[str]) -> List[Dict[str, Any]]:
+def _build_terminal_diagnostics(
+    *,
+    terminal_code: str,
+    reason: str,
+    source_type: str | None,
+    source_instance: str | None,
+    resolved_window: Dict[str, Any] | None = None,
+    key_params: Dict[str, Any] | None = None,
+    counters: Dict[str, Any] | None = None,
+    extras: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "terminal_code": str(terminal_code or "NO_MATCH"),
+        "terminal_reason": str(reason or ""),
+        "generated_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "source_type": str(source_type or "nfa"),
+        "source_instance": str(source_instance or "default"),
+    }
+    if isinstance(resolved_window, dict):
+        payload["window"] = {
+            "start_time": resolved_window.get("start_time"),
+            "end_time": resolved_window.get("end_time"),
+            "label": resolved_window.get("label"),
+        }
+    if isinstance(key_params, dict):
+        payload["key_params"] = key_params
+    if isinstance(counters, dict):
+        payload["counters"] = counters
+    if isinstance(extras, dict):
+        for k, v in extras.items():
+            if v is not None:
+                payload[k] = v
+    return payload
+
+
+def _make_terminal_artifacts(
+    job_id: str,
+    filename_noext: str,
+    reason: str,
+    *,
+    terminal_code: str,
+    diagnostics: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if terminal_code == "NO_MATCH":
+        suffix = "no_data"
+    elif terminal_code == "EMPTY_RESULT":
+        suffix = "empty_result"
+    else:
+        suffix = "query_failed"
+    txt = safe_artifact_path(job_id, f"{filename_noext}-{suffix}.txt")
+    txt.write_text(f"{reason}\n", encoding="utf-8")
+    diag = safe_artifact_path(job_id, f"{filename_noext}-diagnostics.json")
+    diag.write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return [
+        {
+            "filename": txt.name,
+            "size": txt.stat().st_size,
+            "path": str(txt),
+            "terminal_code": terminal_code,
+            "terminal_reason": reason,
+        },
+        {
+            "filename": diag.name,
+            "size": diag.stat().st_size,
+            "path": str(diag),
+            "artifact_kind": "diagnostics",
+            "terminal_code": terminal_code,
+            "terminal_reason": reason,
+        },
+    ]
+
+
+def _export_df(
+    df: pd.DataFrame,
+    job_id: str,
+    filename_noext: str,
+    export_formats: List[str],
+    *,
+    empty_terminal: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
     artifacts: List[Dict[str, Any]] = []
     if df is None:
         return artifacts
@@ -558,6 +812,28 @@ def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_format
         csv_path = safe_artifact_path(job_id, f"{filename_noext}.csv")
         export_csv(df, csv_path)
         artifacts.append({"filename": csv_path.name, "size": csv_path.stat().st_size, "path": str(csv_path)})
+        reason = str((empty_terminal or {}).get("reason") or f"结果为空：{filename_noext}")
+        source_type = str((empty_terminal or {}).get("source_type") or "nfa")
+        source_instance = str((empty_terminal or {}).get("source_instance") or "default")
+        diagnostics = _build_terminal_diagnostics(
+            terminal_code=str((empty_terminal or {}).get("terminal_code") or "EMPTY_RESULT"),
+            reason=reason,
+            source_type=source_type,
+            source_instance=source_instance,
+            resolved_window=(empty_terminal or {}).get("resolved_window"),
+            key_params=(empty_terminal or {}).get("key_params"),
+            counters=(empty_terminal or {}).get("counters"),
+            extras=(empty_terminal or {}).get("diagnostic_extras"),
+        )
+        artifacts.extend(
+            _make_terminal_artifacts(
+                job_id,
+                filename_noext,
+                reason,
+                terminal_code=str((empty_terminal or {}).get("terminal_code") or "EMPTY_RESULT"),
+                diagnostics=diagnostics,
+            )
+        )
         return artifacts
     if "csv" in export_formats:
         p = safe_artifact_path(job_id, f"{filename_noext}.csv")
@@ -569,18 +845,67 @@ def _export_df(df: pd.DataFrame, job_id: str, filename_noext: str, export_format
         artifacts.append({"filename": p.name, "size": p.stat().st_size, "path": str(p)})
     return artifacts
 
+def _make_terminal_no_data_artifacts(
+    job_id: str,
+    filename_noext: str,
+    reason: str,
+    *,
+    source_type: str,
+    source_instance: str,
+    resolved_window: Dict[str, Any] | None,
+    key_params: Dict[str, Any] | None = None,
+    counters: Dict[str, Any] | None = None,
+    extras: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
+    diagnostics = _build_terminal_diagnostics(
+        terminal_code="NO_MATCH",
+        reason=reason,
+        source_type=source_type,
+        source_instance=source_instance,
+        resolved_window=resolved_window,
+        key_params=key_params,
+        counters=counters,
+        extras=extras,
+    )
+    return _make_terminal_artifacts(
+        job_id,
+        filename_noext,
+        reason,
+        terminal_code="NO_MATCH",
+        diagnostics=diagnostics,
+    )
 
 
-def _make_terminal_no_data_artifact(job_id: str, filename_noext: str, reason: str) -> Dict[str, Any]:
-    txt = safe_artifact_path(job_id, f"{filename_noext}-no_data.txt")
-    txt.write_text(f"{reason}\n", encoding="utf-8")
-    return {
-        "filename": txt.name,
-        "size": txt.stat().st_size,
-        "path": str(txt),
-        "terminal_code": "NO_MATCH",
-        "terminal_reason": reason,
-    }
+def _make_terminal_query_failure_artifacts(
+    job_id: str,
+    filename_noext: str,
+    reason: str,
+    *,
+    source_type: str,
+    source_instance: str,
+    resolved_window: Dict[str, Any] | None,
+    key_params: Dict[str, Any] | None = None,
+    counters: Dict[str, Any] | None = None,
+    terminal_code: str = "QUERY_FAILED",
+    extras: Dict[str, Any] | None = None,
+) -> List[Dict[str, Any]]:
+    diagnostics = _build_terminal_diagnostics(
+        terminal_code=terminal_code,
+        reason=reason,
+        source_type=source_type,
+        source_instance=source_instance,
+        resolved_window=resolved_window,
+        key_params=key_params,
+        counters=counters,
+        extras=extras,
+    )
+    return _make_terminal_artifacts(
+        job_id,
+        filename_noext,
+        reason,
+        terminal_code=terminal_code,
+        diagnostics=diagnostics,
+    )
 
 def compute_and_export(
     job_id: str,
@@ -667,21 +992,63 @@ def compute_and_export(
         ini_path = Path(ini_arg)
         if not ini_path.is_absolute():
             ini_path = base_dir / ini_arg
-        db_cfg = c95.load_db_config(str(ini_path))
+        try:
+            db_cfg = c95.load_db_config(str(ini_path))
+        except SystemExit as e:
+            raise ValueError(
+                f"NFA 数据源配置不可用：{ini_path}。"
+                f"请在“数据源配置管理”中配置 NFA 实例，或补全该配置文件后重试。"
+            ) from e
 
-    conn = c95.connect_to_db(db_cfg)
+    try:
+        conn = c95.connect_to_db(db_cfg)
+    except SystemExit as e:
+        raise ValueError(
+            "NFA 数据库连接失败。请检查 NFA 数据源配置（host/port/user/password/db）后重试。"
+        ) from e
 
     artifacts: List[Dict[str, Any]] = []
     try:
+        diag_context: Dict[str, Any] = {}
+
+        def _nfa_empty_terminal(reason: str, counters: Dict[str, Any] | None = None) -> Dict[str, Any]:
+            return {
+                "reason": reason,
+                "source_type": "nfa",
+                "source_instance": source_instance,
+                "resolved_window": resolved_window,
+                "key_params": {
+                    "province": province,
+                    "cp": cp,
+                    "school": school,
+                    "direction": direction,
+                    "settlement_mode": settlement_mode,
+                    "monthly_aggregate": monthly_aggregate,
+                    "aggregate_all": aggregate_all,
+                    "batch_size": batch_size,
+                    "exclude_school": exclude_school,
+                    "combine_v4_v6": combine_v4_v6,
+                    "merge_key": merge_key,
+                },
+                "counters": counters or {},
+                "diagnostic_extras": dict(diag_context),
+            }
+
         _progress(progress_cb, 8, "NFA: 已连接数据源，加载匹配对象")
         schools = c95.get_schools_by_province_and_cp(conn, province, cp, school)
         if not schools:
             reason = f"NFA 无匹配对象：省份={province}，CP={cp}" + (f"，院校={school}" if school else "")
-            artifacts.append(
-                _make_terminal_no_data_artifact(
+            artifacts.extend(
+                _make_terminal_no_data_artifacts(
                     job_id,
                     _build_base_filename(params, window_label, output_filename_template, end_date),
                     reason,
+                    source_type="nfa",
+                    source_instance=source_instance,
+                    resolved_window=resolved_window,
+                    key_params={"province": province, "cp": cp, "school": school},
+                    counters={"matched_schools": 0},
+                    extras=dict(diag_context),
                 )
             )
             return artifacts
@@ -689,17 +1056,40 @@ def compute_and_export(
         base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
         _progress(progress_cb, 9, "NFA: 预筛选窗口内有流量对象")
         pairs_all = [(s["ipgroup_id"], s["nfa_uuid"]) for s in schools]
+        query_path = _infer_query_path(schools)
+        diag_context["query_path"] = query_path
         probe_batch = max(100, min(1000, int(batch_size)))
         if hasattr(c95, "filter_pairs_with_data"):
-            active_pairs = c95.filter_pairs_with_data(conn, pairs_all, start_time, end_time, batch_size=probe_batch)
+            t_prefilter = time.monotonic()
+            active_pairs = c95.filter_pairs_with_data(conn, schools, start_time, end_time, batch_size=probe_batch)
+            prefilter_elapsed_ms = int((time.monotonic() - t_prefilter) * 1000)
+            logger.info(
+                "NFA prefilter done: query_path=%s elapsed_ms=%s pairs_total=%s pairs_active=%s",
+                query_path,
+                prefilter_elapsed_ms,
+                len(pairs_all),
+                len(active_pairs) if isinstance(active_pairs, set) else "unknown",
+            )
+            diag_context["prefilter_elapsed_ms"] = prefilter_elapsed_ms
         else:
             active_pairs = None
+            prefilter_elapsed_ms = None
             _progress(progress_cb, 9, "NFA: 预筛函数缺失，跳过预筛")
         if active_pairs is not None:
             schools = [s for s in schools if (s.get("ipgroup_id"), s.get("nfa_uuid")) in active_pairs]
             if not schools:
                 reason = f"NFA 无匹配流量数据：省份={province}，CP={cp}，窗口={window_label}"
-                return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
+                return _make_terminal_no_data_artifacts(
+                    job_id,
+                    base_name,
+                    reason,
+                    source_type="nfa",
+                    source_instance=source_instance,
+                    resolved_window=resolved_window,
+                    key_params={"province": province, "cp": cp, "school": school, "direction": direction},
+                    counters={"pairs_total": len(pairs_all), "pairs_active": 0},
+                    extras=dict(diag_context),
+                )
             _progress(progress_cb, 11, f"NFA: 窗口内有数据对象 {len(schools)}/{len(pairs_all)}")
 
         # Helper: split [start_time, end_time] into calendar months
@@ -731,6 +1121,7 @@ def compute_and_export(
 
             month_ranges = _month_ranges(start_time, end_time)
             total_months = max(1, len(month_ranges))
+            t_monthly_agg = time.monotonic()
             for i, rg in enumerate(month_ranges, start=1):
                 st = pd.to_datetime(rg['start'])
                 et = pd.to_datetime(rg['end'])
@@ -774,10 +1165,20 @@ def compute_and_export(
                     for it in month_rows:
                         it['month'] = rg['label']
                     rows_all.extend(month_rows)
+            monthly_elapsed_ms = int((time.monotonic() - t_monthly_agg) * 1000)
+            diag_context["query_elapsed_ms"] = monthly_elapsed_ms
+            logger.info(
+                "NFA monthly aggregate done: query_path=%s elapsed_ms=%s schools=%s months=%s rows=%s",
+                query_path,
+                monthly_elapsed_ms,
+                len(schools),
+                len(month_ranges),
+                len(rows_all),
+            )
 
             dfm = _to_dataframe(rows_all)
+            sort_keys = []
             if not dfm.empty:
-                sort_keys = []
                 if 'month' in dfm.columns:
                     sort_keys.append('month')
                 if 'cp' in dfm.columns:
@@ -786,10 +1187,70 @@ def compute_and_export(
                 name_col = 'school_name' if 'school_name' in dfm.columns else ('ipgroup_name' if 'ipgroup_name' in dfm.columns else None)
                 if name_col:
                     sort_keys.append(name_col)
-                if sort_keys:
-                    dfm = dfm.sort_values(by=sort_keys, kind='stable')
+            if sort_keys:
+                dfm = dfm.sort_values(by=sort_keys, kind='stable')
+            if dfm.empty:
+                try:
+                    t_probe = time.monotonic()
+                    probe = _nfa_has_any_raw_points(conn, schools, start_time, end_time)
+                    probe_elapsed_ms = int((time.monotonic() - t_probe) * 1000)
+                    diag_context["probe_status"] = "found_raw_points" if probe.get("has_points") else "no_raw_points"
+                    diag_context["probe_elapsed_ms"] = probe_elapsed_ms
+                    if probe.get("query_path"):
+                        diag_context["query_path"] = str(probe.get("query_path"))
+                    logger.info(
+                        "NFA empty probe done: has_points=%s query_path=%s elapsed_ms=%s",
+                        bool(probe.get("has_points")),
+                        probe.get("query_path"),
+                        probe_elapsed_ms,
+                    )
+                    if probe.get("has_points"):
+                        raise ValueError(
+                            f"NFA 查询存在原始点位，但按月聚合结果为空。可能是批量查询超时或连接不稳定。"
+                            f"建议缩小时间范围或降低 batch_size 后重试。窗口={window_label}"
+                        )
+                except ValueError:
+                    raise
+                except Exception as e:
+                    terminal_code = _classify_query_error(e)
+                    reason = (
+                        f"NFA 空结果探测失败：{e}。"
+                        f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                    )
+                    return _make_terminal_query_failure_artifacts(
+                        job_id,
+                        f"{base_name}-monthly",
+                        reason,
+                        source_type="nfa",
+                        source_instance=source_instance,
+                        resolved_window=resolved_window,
+                        key_params={
+                            "province": province,
+                            "cp": cp,
+                            "school": school,
+                            "direction": direction,
+                            "monthly_aggregate": monthly_aggregate,
+                            "aggregate_all": aggregate_all,
+                        },
+                        counters={"matched_schools": len(schools), "months": len(month_ranges)},
+                        terminal_code=terminal_code,
+                        extras={
+                            **diag_context,
+                            "probe_status": "probe_failed",
+                            "exception_type": type(e).__name__,
+                        },
+                    )
             _progress(progress_cb, 92, "NFA: 正在导出按月产物")
-            artifacts += _export_df(dfm, job_id, f"{base_name}-monthly", export_formats)
+            artifacts += _export_df(
+                dfm,
+                job_id,
+                f"{base_name}-monthly",
+                export_formats,
+                empty_terminal=_nfa_empty_terminal(
+                    f"NFA 按月聚合结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                    {"matched_schools": len(schools), "months": len(month_ranges)},
+                ),
+            )
             return artifacts
 
         if exclude_school:
@@ -834,7 +1295,16 @@ def compute_and_export(
                 if sortby and sortby in df_excluded.columns:
                     df_excluded = df_excluded.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 _progress(progress_cb, 76, "NFA: 正在导出排除组产物")
-                artifacts += _export_df(df_excluded, job_id, f"{base_name}_excluded", export_formats)
+                artifacts += _export_df(
+                    df_excluded,
+                    job_id,
+                    f"{base_name}_excluded",
+                    export_formats,
+                    empty_terminal=_nfa_empty_terminal(
+                        f"NFA 排除组结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                        {"excluded_schools": len(excluded_schools)},
+                    ),
+                )
 
             # 2) 剩余组（整体汇总）
             if remaining_schools:
@@ -939,7 +1409,16 @@ def compute_and_export(
                     if sortby and sortby in df_remaining.columns:
                         df_remaining = df_remaining.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                     _progress(progress_cb, 90, "NFA: 正在导出剩余组产物")
-                    artifacts += _export_df(df_remaining, job_id, f"{base_name}_remaining", export_formats)
+                    artifacts += _export_df(
+                        df_remaining,
+                        job_id,
+                        f"{base_name}_remaining",
+                        export_formats,
+                        empty_terminal=_nfa_empty_terminal(
+                            f"NFA 剩余组结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                            {"remaining_schools": len(remaining_schools)},
+                        ),
+                    )
             return artifacts
         else:
             base_name = _build_base_filename(params, window_label, output_filename_template, end_date)
@@ -978,16 +1457,36 @@ def compute_and_export(
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 _progress(progress_cb, 92, "NFA: 正在导出产物")
-                artifacts += _export_df(df, job_id, base_name, export_formats)
+                artifacts += _export_df(
+                    df,
+                    job_id,
+                    base_name,
+                    export_formats,
+                    empty_terminal=_nfa_empty_terminal(
+                        f"NFA 汇总结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                        {"matched_schools": len(schools), "aggregate_all": True},
+                    ),
+                )
                 return artifacts
             else:
                 # 逐校（或逐校按天）- 批量拉取 + 内存分组
                 if settlement_mode == 'daily_95_avg':
                     # 先每日95，再根据 export_daily 决定是否求平均
+                    t_rows = time.monotonic()
                     rows_daily = c95.process_schools_batched(
                         conn, schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
                         direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                    )
+                    query_elapsed_ms = int((time.monotonic() - t_rows) * 1000)
+                    diag_context["query_elapsed_ms"] = query_elapsed_ms
+                    logger.info(
+                        "NFA batched query done: query_path=%s elapsed_ms=%s schools=%s rows=%s export_daily=%s",
+                        query_path,
+                        query_elapsed_ms,
+                        len(schools),
+                        len(rows_daily or []),
+                        bool(export_daily),
                     )
                     # 不再回退到逐院校单查：空结果即表示该窗口无匹配流量数据
                     df_daily = _to_dataframe(rows_daily)
@@ -1005,6 +1504,7 @@ def compute_and_export(
                         else:
                             df = pd.DataFrame()
                 else:
+                    t_rows = time.monotonic()
                     rows = c95.process_schools_batched(
                         conn, schools,
                         pd.to_datetime(start_time), pd.to_datetime(end_time),
@@ -1012,13 +1512,92 @@ def compute_and_export(
                     )
                     # 不再回退到原逐院校方法：避免无数据场景下逐校空查导致长时间运行
                     df = _to_dataframe(rows)
+                    query_elapsed_ms = int((time.monotonic() - t_rows) * 1000)
+                    diag_context["query_elapsed_ms"] = query_elapsed_ms
+                    logger.info(
+                        "NFA batched query done: query_path=%s elapsed_ms=%s schools=%s rows=%s export_daily=%s",
+                        query_path,
+                        query_elapsed_ms,
+                        len(schools),
+                        len(rows or []),
+                        bool(export_daily),
+                    )
                 if df is None or df.empty:
+                    try:
+                        t_probe = time.monotonic()
+                        probe = _nfa_has_any_raw_points(conn, schools, start_time, end_time)
+                        probe_elapsed_ms = int((time.monotonic() - t_probe) * 1000)
+                        diag_context["probe_status"] = "found_raw_points" if probe.get("has_points") else "no_raw_points"
+                        diag_context["probe_elapsed_ms"] = probe_elapsed_ms
+                        if probe.get("query_path"):
+                            diag_context["query_path"] = str(probe.get("query_path"))
+                        logger.info(
+                            "NFA empty probe done: has_points=%s query_path=%s elapsed_ms=%s",
+                            bool(probe.get("has_points")),
+                            probe.get("query_path"),
+                            probe_elapsed_ms,
+                        )
+                        if probe.get("has_points"):
+                            raise ValueError(
+                                f"NFA 查询存在原始点位，但聚合结果为空。可能是批量查询超时或连接不稳定。"
+                                f"建议缩小时间范围或降低 batch_size 后重试。窗口={window_label}"
+                            )
+                    except ValueError:
+                        raise
+                    except Exception as e:
+                        terminal_code = _classify_query_error(e)
+                        reason = (
+                            f"NFA 空结果探测失败：{e}。"
+                            f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                        )
+                        return _make_terminal_query_failure_artifacts(
+                            job_id,
+                            base_name,
+                            reason,
+                            source_type="nfa",
+                            source_instance=source_instance,
+                            resolved_window=resolved_window,
+                            key_params={
+                                "province": province,
+                                "cp": cp,
+                                "school": school,
+                                "direction": direction,
+                                "monthly_aggregate": monthly_aggregate,
+                                "aggregate_all": aggregate_all,
+                            },
+                            counters={"matched_schools": len(schools), "pairs_total": len(pairs_all)},
+                            terminal_code=terminal_code,
+                            extras={
+                                **diag_context,
+                                "probe_status": "probe_failed",
+                                "exception_type": type(e).__name__,
+                            },
+                        )
                     reason = f"NFA 无匹配流量数据：省份={province}，CP={cp}，窗口={window_label}"
-                    return [_make_terminal_no_data_artifact(job_id, base_name, reason)]
+                    return _make_terminal_no_data_artifacts(
+                        job_id,
+                        base_name,
+                        reason,
+                        source_type="nfa",
+                        source_instance=source_instance,
+                        resolved_window=resolved_window,
+                        key_params={"province": province, "cp": cp, "school": school, "direction": direction},
+                        counters={"matched_schools": len(schools), "pairs_total": len(pairs_all)},
+                        extras=dict(diag_context),
+                    )
                 if sortby and sortby in df.columns:
                     df = df.sort_values(by=sortby, ascending=(sort_order == 'asc'))
                 _progress(progress_cb, 92, "NFA: 正在导出产物")
-                artifacts += _export_df(df, job_id, base_name, export_formats)
+                artifacts += _export_df(
+                    df,
+                    job_id,
+                    base_name,
+                    export_formats,
+                    empty_terminal=_nfa_empty_terminal(
+                        f"NFA 产物结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                        {"matched_schools": len(schools)},
+                    ),
+                )
                 return artifacts
     finally:
         try:

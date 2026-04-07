@@ -1,3 +1,9 @@
+if (!window.Vue) {
+  const root = document.getElementById('app')
+  if (root) {
+    root.innerHTML = '<div style="margin:24px;padding:16px;border:1px solid #f1b3b3;background:#fff2f2;color:#8a1f1f;border-radius:8px;">前端依赖加载失败：Vue 未成功加载。请检查网络或刷新页面后重试。</div>'
+  }
+} else {
 const { createApp, reactive } = Vue
 
 function apiFetch(path, options = {}, apiKey) {
@@ -18,18 +24,21 @@ createApp({
       updateApplying: false,
       tasks: [],
       runs: [],
+      taskGroups: [],
       tasksPage: { items: [], total: 0, page: 1, page_size: 20 },
       runsPage: { items: [], total: 0, page: 1, page_size: 20 },
       selectedTaskIds: [],
       selectedRunIds: [],
       downloadPreview: { matched_runs: 0, matched_files: 0 },
       runsFilterTaskId: null,
-      tasksQuery: { q: '', sort_by: 'id', sort_order: 'desc' },
+      tasksQuery: { q: '', task_kind: 'all', task_group: '', sort_by: 'id', sort_order: 'desc' },
       runsQuery: { status: '', sort_by: 'started_at', sort_order: 'desc', month: '', task_kind: 'all', file_format: 'csv' },
       tasksPageJump: 1,
       runsPageJump: 1,
       dataSourceCatalog: { nfa: ['default'], edc: [] },
       ui: { showSourceAdmin: false, showBulkImport: false },
+      groupAdmin: { new_name: '', selected_name: '', rename_to: '' },
+      groupAssignSavingTaskId: null,
       notice: { message: '', kind: 'info', at: 0 },
       sourceAdmin: {
         source_type: 'all',
@@ -68,6 +77,7 @@ createApp({
       },
       newTask: {
         name: '',
+        group_name: '',
         active: true,
         kind: 'one_off',
         data_source_type: 'nfa',
@@ -78,11 +88,12 @@ createApp({
         timezone: 'Asia/Shanghai',
         window_selector: 'custom',
         window_params: {},
-        params: { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300 },
+        params: { direction: 'both', export_daily: false, sortby: '', sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, merge_key: '', batch_size: 200, school: '', exclude_school: '', unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300, edc_name: '' },
         export_formats: ['csv'],
         output_filename_template: ''
       },
-      editTask: null
+      editTask: null,
+      logViewer: { visible: false, jobId: '', content: '', loading: false, error: '' }
     }
   },
   methods: {
@@ -150,6 +161,26 @@ createApp({
       }
       return ''
     },
+    runTerminalCode(run) {
+      if (!run || typeof run !== 'object') return ''
+      if (Array.isArray(run.artifacts)) {
+        const marked = run.artifacts.find((a) => a && typeof a === 'object' && a.terminal_code)
+        if (marked && marked.terminal_code) return String(marked.terminal_code).toUpperCase()
+      }
+      return ''
+    },
+    runEndReasonText(run) {
+      const reason = this.runEndReason(run)
+      if (!reason) return ''
+      const code = this.runTerminalCode(run)
+      if (code === 'QUERY_TIMEOUT' || code === 'QUERY_FAILED') {
+        return `查询失败（超时或数据库异常）：${reason}`
+      }
+      if (code === 'EMPTY_RESULT') {
+        return `确认为空数据：${reason}`
+      }
+      return reason
+    },
     // 将 'YYYY-MM-DD HH:MM:SS' 转换为 <input type=datetime-local> 需要的 'YYYY-MM-DDTHH:MM:SS'
     toLocalInputString(str) {
       if (!str || typeof str !== 'string') return ''
@@ -188,6 +219,7 @@ createApp({
       return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`
     },
     initRangePickerNew() {
+      if (typeof window.flatpickr !== 'function') return
       const el = document.getElementById('range-new')
       if (!el) return
       if (this._fpNew) { try { this._fpNew.destroy() } catch {} this._fpNew = null }
@@ -209,6 +241,7 @@ createApp({
       })
     },
     initRangePickerEdit() {
+      if (typeof window.flatpickr !== 'function') return
       const el = document.getElementById('range-edit')
       if (!el) return
       if (this._fpEdit) { try { this._fpEdit.destroy() } catch {} this._fpEdit = null }
@@ -544,30 +577,59 @@ createApp({
       }
       this.normalizeSourceParams(obj)
     },
+    defaultTaskParams() {
+      return {
+        direction: 'both',
+        export_daily: false,
+        sortby: '',
+        sort_order: 'desc',
+        aggregate_all: false,
+        combine_v4_v6: false,
+        merge_key: '',
+        batch_size: 200,
+        school: '',
+        exclude_school: '',
+        unit_base: 1024,
+        settlement_mode: 'range_95',
+        monthly_aggregate: false,
+        data_budget_enabled: false,
+        data_budget_mul: 8,
+        data_budget_div: 300,
+        edc_name: ''
+      }
+    },
     normalizeSourceParams(obj) {
       if (!obj) return
       const st = (obj.data_source_type || 'nfa').toLowerCase()
       const p = obj.params = (obj.params || {})
+      const d = this.defaultTaskParams()
+      for (const k of Object.keys(d)) {
+        if (p[k] == null) p[k] = d[k]
+      }
+      if (!p.sort_order || (p.sort_order !== 'asc' && p.sort_order !== 'desc')) p.sort_order = 'desc'
+      if (p.unit_base !== 1000 && p.unit_base !== 1024) p.unit_base = 1024
+      if (!p.settlement_mode) p.settlement_mode = 'range_95'
+      if (p.batch_size == null || p.batch_size === '') p.batch_size = 200
+      p.export_daily = !!p.export_daily
+      p.monthly_aggregate = !!p.monthly_aggregate
       if (st === 'edc') {
         p.direction = 'both'
         p.aggregate_all = false
         p.combine_v4_v6 = false
         p.merge_key = ''
-        if (typeof p.monthly_aggregate !== 'boolean') p.monthly_aggregate = false
+        p.school = ''
+        p.exclude_school = ''
+        p.batch_size = 200
+        if (typeof p.data_budget_enabled !== 'boolean') p.data_budget_enabled = false
         delete p.province
         delete p.cp
-        delete p.school
-        delete p.exclude_school
-        delete p.batch_size
-        if (typeof p.data_budget_enabled !== 'boolean') p.data_budget_enabled = false
         if (p.data_budget_mul == null || p.data_budget_mul === '') p.data_budget_mul = 8
         if (p.data_budget_div == null || p.data_budget_div === '') p.data_budget_div = 300
       } else {
         if (!p.direction) p.direction = 'both'
         if (typeof p.aggregate_all !== 'boolean') p.aggregate_all = false
         if (typeof p.combine_v4_v6 !== 'boolean') p.combine_v4_v6 = false
-        if (typeof p.monthly_aggregate !== 'boolean') p.monthly_aggregate = false
-        if (!p.batch_size) p.batch_size = 200
+        if (!p.batch_size || Number(p.batch_size) < 10) p.batch_size = 200
         delete p.edc_name
         delete p.data_budget_enabled
         delete p.data_budget_mul
@@ -747,6 +809,7 @@ createApp({
         }
       }
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
       let msg = `导入完成：成功 ${ok}，失败 ${failures.length}`
       if (failures.length) {
         msg += `\n失败示例：\n${failures.slice(0, 5).join('\n')}`
@@ -756,12 +819,100 @@ createApp({
     },
     async loadTasks() {
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
+    },
+    async loadTaskGroups() {
+      const res = await apiFetch('/api/tasks/groups', {}, this.apiKey)
+      if (!res.ok) { return }
+      const data = await res.json()
+      this.taskGroups = Array.isArray(data.items) ? data.items : []
+      if (this.tasksQuery.task_group && !this.taskGroups.includes(this.tasksQuery.task_group)) {
+        this.tasksQuery.task_group = ''
+      }
+      if (this.groupAdmin.selected_name && !this.taskGroups.includes(this.groupAdmin.selected_name)) {
+        this.groupAdmin.selected_name = ''
+        this.groupAdmin.rename_to = ''
+      }
+    },
+    async createTaskGroup() {
+      const name = String(this.groupAdmin.new_name || '').trim()
+      if (!name) { alert('请输入分组名'); return }
+      const res = await apiFetch('/api/tasks/groups', { method: 'POST', body: JSON.stringify({ name }) }, this.apiKey)
+      if (!res.ok) { await this.showApiError('创建分组', res); return }
+      this.groupAdmin.new_name = ''
+      await this.loadTaskGroups()
+      this.groupAdmin.selected_name = name
+      this.groupAdmin.rename_to = name
+      this.notify('分组创建成功', 'info', 2000)
+    },
+    onSelectGroupAdmin() {
+      this.groupAdmin.rename_to = this.groupAdmin.selected_name || ''
+    },
+    async renameTaskGroup() {
+      const oldName = String(this.groupAdmin.selected_name || '').trim()
+      const newName = String(this.groupAdmin.rename_to || '').trim()
+      if (!oldName) { alert('请先选择分组'); return }
+      if (!newName) { alert('请输入新分组名'); return }
+      let merge = false
+      if (oldName !== newName && this.taskGroups.includes(newName)) {
+        if (!confirm(`目标分组「${newName}」已存在，确认合并到该分组吗？`)) return
+        merge = true
+      }
+      const payload = { old_name: oldName, new_name: newName, merge }
+      const res = await apiFetch('/api/tasks/groups/rename', { method: 'PATCH', body: JSON.stringify(payload) }, this.apiKey)
+      if (!res.ok) { await this.showApiError('重命名分组', res); return }
+      await this.loadTaskGroups()
+      this.groupAdmin.selected_name = newName
+      this.groupAdmin.rename_to = newName
+      await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      this.notify('分组重命名成功', 'info', 2200)
+    },
+    async deleteTaskGroup() {
+      const name = String(this.groupAdmin.selected_name || '').trim()
+      if (!name) { alert('请先选择分组'); return }
+      if (!confirm(`确认删除分组「${name}」？该分组下任务会变为未分组。`)) return
+      const res = await apiFetch('/api/tasks/groups?name=' + encodeURIComponent(name), { method: 'DELETE' }, this.apiKey)
+      if (!res.ok) { await this.showApiError('删除分组', res); return }
+      this.groupAdmin.selected_name = ''
+      this.groupAdmin.rename_to = ''
+      await this.loadTaskGroups()
+      await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      this.notify('分组删除成功', 'info', 2200)
+    },
+    async quickAssignTaskGroup(task, value) {
+      if (!task || !task.id) return
+      const next = String(value || '').trim()
+      const target = next || null
+      const current = task.group_name ? String(task.group_name) : null
+      if (target === current) return
+      const prev = current
+      task.group_name = target
+      this.groupAssignSavingTaskId = Number(task.id)
+      try {
+        const payload = { group_name: target }
+        const res = await apiFetch('/api/tasks/' + task.id + '/group', { method: 'PATCH', body: JSON.stringify(payload) }, this.apiKey)
+        if (!res.ok) {
+          task.group_name = prev
+          await this.showApiError('修改任务分组', res)
+          return
+        }
+        const data = await res.json()
+        task.group_name = data.group_name || null
+        await this.loadTaskGroups()
+        if (this.tasksQuery.task_group) {
+          await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+        }
+      } finally {
+        this.groupAssignSavingTaskId = null
+      }
     },
     async loadTasksPage(page = 1, pageSize = 20) {
       const params = new URLSearchParams()
       params.set('page', String(page))
       params.set('page_size', String(pageSize))
       if (this.tasksQuery && this.tasksQuery.q) params.set('q', this.tasksQuery.q)
+      if (this.tasksQuery && this.tasksQuery.task_kind && this.tasksQuery.task_kind !== 'all') params.set('task_kind', this.tasksQuery.task_kind)
+      if (this.tasksQuery && this.tasksQuery.task_group) params.set('task_group', this.tasksQuery.task_group)
       if (this.tasksQuery && this.tasksQuery.sort_by) params.set('sort_by', this.tasksQuery.sort_by)
       if (this.tasksQuery && this.tasksQuery.sort_order) params.set('sort_order', this.tasksQuery.sort_order)
       const res = await apiFetch('/api/tasks/page?' + params.toString(), {}, this.apiKey)
@@ -796,13 +947,7 @@ createApp({
       clone.window_params = clone.window_params || {}
       // 回填 datetime-local 显示值
       this.normalizeCustomWindow(clone)
-      clone.params = clone.params || { direction: 'both', export_daily: false, sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, batch_size: 200, unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300 }
-      if (typeof clone.params.aggregate_all !== 'boolean') clone.params.aggregate_all = false
-      if (typeof clone.params.combine_v4_v6 !== 'boolean') clone.params.combine_v4_v6 = false
-      if (typeof clone.params.monthly_aggregate !== 'boolean') clone.params.monthly_aggregate = false
-      if (!clone.params.batch_size) clone.params.batch_size = 200
-      if (clone.params.unit_base !== 1000 && clone.params.unit_base !== 1024) clone.params.unit_base = 1024
-      if (!clone.params.settlement_mode) clone.params.settlement_mode = 'range_95'
+      clone.params = clone.params || {}
       clone.export_formats = clone.export_formats && clone.export_formats.length ? clone.export_formats : ['csv']
       clone.timezone = clone.timezone || 'Asia/Shanghai'
       this.onSourceTypeChange(clone)
@@ -818,7 +963,7 @@ createApp({
       this.normalizeSourceParams(this.editTask)
       this.normalizeCustomWindow(this.editTask)
       if (!this.validateTask(this.editTask)) return
-      const allowKeys = ['name','active','kind','data_source_type','data_source_instance','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
+      const allowKeys = ['name','group_name','active','kind','data_source_type','data_source_instance','schedule_type','schedule_expr','schedule_time_of_day','timezone','window_selector','window_params','params','export_formats','output_filename_template']
       const body = {}
       for (const k of allowKeys) { if (k in this.editTask) body[k] = this.editTask[k] }
       this.normalizeSourceParams(body)
@@ -855,6 +1000,7 @@ createApp({
       if (this.tasks.length === 0 && curPage > 1) {
         await this.loadTasksPage(curPage - 1, this.tasksPage.page_size)
       }
+      await this.loadTaskGroups()
     },
     async runTask(id) {
       const res = await apiFetch('/api/tasks/' + id + '/run', { method: 'POST' }, this.apiKey)
@@ -890,6 +1036,12 @@ createApp({
       this.previewBatchDownload()
     },
     applyTasksQuery() {
+      this.loadTasksPage(1, this.tasksPage.page_size)
+    },
+    clearTasksQuery() {
+      this.tasksQuery.q = ''
+      this.tasksQuery.task_kind = 'all'
+      this.tasksQuery.task_group = ''
       this.loadTasksPage(1, this.tasksPage.page_size)
     },
     applyRunsQuery() {
@@ -990,6 +1142,33 @@ createApp({
       const arr = Array.isArray(r && r.progress_events) ? r.progress_events : []
       return arr.slice(-6)
     },
+    runDiagnosticsArtifact(r) {
+      const arr = Array.isArray(r && r.artifacts) ? r.artifacts : []
+      return arr.find((a) => String(a && a.artifact_kind || '') === 'diagnostics') || null
+    },
+    async viewRunLog(run) {
+      if (!run || !run.id) return
+      const jobId = String(run.id)
+      this.logViewer = { visible: true, jobId, content: '', loading: true, error: '' }
+      try {
+        const res = await apiFetch('/api/jobs/' + encodeURIComponent(jobId) + '/log-tail?lines=200', {}, this.apiKey)
+        if (!res.ok) {
+          const msg = await this.extractApiError(res, '加载日志失败')
+          this.logViewer.loading = false
+          this.logViewer.error = msg
+          return
+        }
+        const data = await res.json()
+        this.logViewer.content = String((data && data.content) || '')
+        this.logViewer.loading = false
+      } catch (e) {
+        this.logViewer.loading = false
+        this.logViewer.error = String(e)
+      }
+    },
+    closeLogViewer() {
+      this.logViewer = { visible: false, jobId: '', content: '', loading: false, error: '' }
+    },
     taskChecked(id) {
       return this.selectedTaskIds.includes(Number(id))
     },
@@ -1034,6 +1213,7 @@ createApp({
       if (!res.ok) { await this.showApiError('批量删除任务', res); return }
       this.selectedTaskIds = []
       await this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
+      await this.loadTaskGroups()
     },
     async batchRunTasks() {
       if (!this.selectedTaskIds.length) { alert('请先选择任务'); return }
@@ -1321,6 +1501,7 @@ createApp({
     this.checkUpdate()
     this.refreshUpdateStatus(true)
     this.loadDataSources()
+    this.loadTaskGroups()
     this.loadTasksPage(this.tasksPage.page, this.tasksPage.page_size)
     this.loadRunsPage(this.runsPage.page, this.runsPage.page_size)
     this.previewBatchDownload()
@@ -1337,6 +1518,7 @@ createApp({
     if (this._noticeTimer) clearTimeout(this._noticeTimer)
   }
 }).mount('#app')
+}
 
 
 

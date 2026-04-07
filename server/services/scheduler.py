@@ -68,6 +68,18 @@ def _extract_terminal_reason(artifacts: list[dict] | None) -> Optional[str]:
     return None
 
 
+def _extract_terminal_code(artifacts: list[dict] | None) -> Optional[str]:
+    if not isinstance(artifacts, list):
+        return None
+    for item in artifacts:
+        if not isinstance(item, dict):
+            continue
+        code = item.get("terminal_code")
+        if code:
+            return str(code)
+    return None
+
+
 def _ensure_scheduler():
     global scheduler
     if scheduler is None:
@@ -134,6 +146,20 @@ async def _execute_job(job_id: str):
                     # ad-hoc: allow export options via resolved_params
                     export_formats = params.get('export_formats') or export_formats
                     output_filename_template = params.get('output_filename_template') or output_filename_template
+            logger.info(
+                "Job snapshot: task_id=%s source=%s/%s window=[%s ~ %s] label=%s",
+                run.task_id if run else None,
+                params.get("data_source_type") or "nfa",
+                params.get("data_source_instance") or "default",
+                window.get("start_time"),
+                window.get("end_time"),
+                window.get("label"),
+            )
+            logger.info(
+                "Job params summary: keys=%s export_formats=%s",
+                ",".join(sorted([str(k) for k in params.keys()])),
+                export_formats or ["csv"],
+            )
 
             def _progress_cb(pct: int, stage: str):
                 with session_scope() as s2:
@@ -177,17 +203,27 @@ async def _execute_job(job_id: str):
                 raise last_err
             # Update DB
             terminal_reason = _extract_terminal_reason(artifacts)
+            terminal_code = _extract_terminal_code(artifacts)
+            is_query_failure = str(terminal_code or "").upper() in {"QUERY_TIMEOUT", "QUERY_FAILED"}
             with session_scope() as s:
                 run: JobRun = s.get(JobRun, job_id)
-                run.status = "succeeded"
+                run.status = "failed" if is_query_failure else "succeeded"
                 run.progress_pct = 100
-                run.progress_stage = "执行完成（无匹配数据）" if terminal_reason else "执行完成"
+                if is_query_failure:
+                    run.progress_stage = "执行失败（查询异常）"
+                else:
+                    run.progress_stage = "执行完成（无匹配数据）" if terminal_reason else "执行完成"
                 _append_progress_event(run, 100, run.progress_stage)
                 run.finished_at = datetime.utcnow()
                 run.artifacts = json.dumps(artifacts, ensure_ascii=False)
                 run.error_message = terminal_reason if terminal_reason else None
                 run.log_path = str(get_job_log_path(job_id))
                 s.add(run)
+            if terminal_reason:
+                level = logger.error if is_query_failure else logger.warning
+                level("Job terminal result: code=%s reason=%s", terminal_code or "UNKNOWN", terminal_reason)
+            else:
+                logger.info("Job artifacts generated: %s", len(artifacts or []))
             # Sync optional budget summary to parent task for quick dashboard view.
             try:
                 from ..models import Task as _Task
@@ -203,7 +239,10 @@ async def _execute_job(job_id: str):
                                 s.add(t)
             except Exception:
                 pass
-            logger.info("Job succeeded: %s", job_id)
+            if is_query_failure:
+                logger.error("Job failed by terminal code: %s (%s)", job_id, terminal_code)
+            else:
+                logger.info("Job succeeded: %s", job_id)
         except asyncio.CancelledError:
             with session_scope() as s:
                 run: JobRun = s.get(JobRun, job_id)
@@ -218,6 +257,19 @@ async def _execute_job(job_id: str):
                     s.add(run)
             logger.warning("Job cancelled during shutdown: %s", job_id)
             return
+        except SystemExit as e:
+            with session_scope() as s:
+                run: JobRun = s.get(JobRun, job_id)
+                if run:
+                    run.status = "failed"
+                    run.progress_pct = 100
+                    run.progress_stage = "执行失败"
+                    _append_progress_event(run, 100, "执行失败")
+                    run.finished_at = datetime.utcnow()
+                    run.error_message = f"任务执行被中止(SystemExit): {e}"
+                    run.log_path = str(get_job_log_path(job_id))
+                    s.add(run)
+            logger.exception("Job failed with SystemExit: %s", job_id)
         except Exception as e:  # noqa
             with session_scope() as s:
                 run: JobRun = s.get(JobRun, job_id)

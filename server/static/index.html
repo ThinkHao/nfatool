@@ -6,9 +6,25 @@
   <title>NFA/EDC 95th 服务</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css" />
+  <link rel="stylesheet" href="https://cdn.staticfile.net/flatpickr/4.6.13/flatpickr.min.css" />
   <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script>
+    if (!window.Vue) {
+      document.write('<script src="https://cdn.staticfile.net/vue/3.5.13/vue.global.prod.min.js"><' + '/script>')
+    }
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
+  <script>
+    if (!window.flatpickr) {
+      document.write('<script src="https://cdn.staticfile.net/flatpickr/4.6.13/flatpickr.min.js"><' + '/script>')
+    }
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/flatpickr/dist/l10n/zh.js"></script>
+  <script>
+    if (!window.flatpickr || !window.flatpickr.l10ns || !window.flatpickr.l10ns.zh) {
+      document.write('<script src="https://cdn.staticfile.net/flatpickr/4.6.13/l10n/zh.min.js"><' + '/script>')
+    }
+  </script>
 </head>
 <body>
   <div id="app">
@@ -26,6 +42,7 @@
         <span class="hint" v-if="updateInfo && updateInfo.ok">
           版本：{{ updateInfo.current_version || '-' }} / {{ updateInfo.latest_version || '-' }}
           {{ updateInfo.update_available ? '（可升级）' : '（最新）' }}
+          <template v-if="updateInfo.source">，来源：{{ updateInfo.source }}</template>
         </span>
         <span class="hint" v-if="updateInfo && !updateInfo.ok">更新检测失败：{{ updateInfo.message }}</span>
         <span class="hint" v-if="updateStatus && updateStatus.status && updateStatus.status !== 'idle'">
@@ -213,6 +230,7 @@
         <h3>Step 1. 基础信息</h3>
         <div class="row">
           <input v-model.trim="newTask.name" placeholder="任务名" />
+          <input v-model.trim="newTask.group_name" placeholder="任务分组（可选）" />
           <label><input type="checkbox" v-model="newTask.active" /> 启用</label>
           <label>
             数据源：
@@ -338,6 +356,7 @@
       <h2>编辑任务 #{{ editTask.id }}</h2>
       <div class="row">
         <input v-model.trim="editTask.name" placeholder="任务名" />
+        <input v-model.trim="editTask.group_name" placeholder="任务分组（可选）" />
         <label><input type="checkbox" v-model="editTask.active" /> 启用</label>
         <label>
           数据源：
@@ -408,6 +427,28 @@
         </select>
         <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
         <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合导出</label>
+
+        <template v-if="editTask.data_source_type==='nfa'">
+          <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" /> V4/V6累加</label>
+          <select v-model="editTask.params.merge_key">
+            <option value="">合并键：不合并</option>
+            <option value="ipgroup_name_base">按名称去后缀(_V4/_V6)</option>
+            <option value="ipgroup_name">按IP组名称</option>
+            <option value="school_name_plus_cp">按学校名称+CP</option>
+            <option value="school_id">按学校ID</option>
+            <option value="school_name">按学校名称</option>
+          </select>
+          <label><input type="checkbox" v-model="editTask.params.aggregate_all" /> 全部院校汇总</label>
+          <input v-model.number="editTask.params.batch_size" type="number" min="10" placeholder="batch_size(默认200)" />
+          <input v-model.trim="editTask.params.school" placeholder="指定院校(逗号分隔)" />
+          <input v-model.trim="editTask.params.exclude_school" placeholder="排除院校(逗号分隔)" />
+        </template>
+
+        <input v-model.trim="editTask.params.sortby" placeholder="排序字段" />
+        <select v-model="editTask.params.sort_order">
+          <option value="desc">desc</option>
+          <option value="asc">asc</option>
+        </select>
       </div>
       <div class="row">
         <label><input type="checkbox" value="csv" v-model="editTask.export_formats" /> CSV</label>
@@ -426,11 +467,33 @@
           <div class="row">
             <button @click="loadTasks">刷新任务列表</button>
             <input v-model.trim="tasksQuery.q" placeholder="搜索任务名" />
+            <select v-model="tasksQuery.task_kind">
+              <option value="all">全部任务类型</option>
+              <option value="periodic">仅周期性</option>
+              <option value="one_off">仅一次性</option>
+            </select>
+            <select v-model="tasksQuery.task_group">
+              <option value="">全部分组</option>
+              <option v-for="g in taskGroups" :key="'tg-' + g" :value="g">{{ g }}</option>
+            </select>
             <button @click="applyTasksQuery">应用</button>
+            <button class="btn-muted" @click="clearTasksQuery">清空筛选</button>
             <button class="btn-muted" @click="selectAllTasksOnPage">本页全选</button>
             <button class="btn-muted" @click="clearTaskSelection">清空选择</button>
             <button @click="batchRunTasks">批量运行</button>
             <button class="btn-danger" @click="batchDeleteTasks">批量删除</button>
+          </div>
+          <div class="row">
+            <span class="hint">分组管理：</span>
+            <input v-model.trim="groupAdmin.new_name" placeholder="新分组名" />
+            <button class="btn-muted" @click="createTaskGroup">创建分组</button>
+            <select v-model="groupAdmin.selected_name" @change="onSelectGroupAdmin">
+              <option value="">选择分组</option>
+              <option v-for="g in taskGroups" :key="'admin-g-' + g" :value="g">{{ g }}</option>
+            </select>
+            <input v-model.trim="groupAdmin.rename_to" placeholder="重命名为" />
+            <button class="btn-muted" @click="renameTaskGroup">重命名</button>
+            <button class="btn-danger" @click="deleteTaskGroup">删除分组</button>
           </div>
         </div>
         <div class="list-wrap">
@@ -444,10 +507,22 @@
                 <span class="chip">#{{ t.id }}</span>
                 <span class="chip">{{ (t.data_source_type || 'nfa').toUpperCase() }}/{{ t.data_source_instance || 'default' }}</span>
                 <span class="chip">{{ t.kind === 'periodic' ? '周期性' : '一次性' }}</span>
+                <span class="chip" v-if="t.group_name">分组 {{ t.group_name }}</span>
                 <span class="chip">{{ t.active ? '已启用' : '已暂停' }}</span>
                 <span class="chip">窗口 {{ t.window_selector }}</span>
               </div>
               <div class="item-sub">调度：{{ scheduleSummary(t) }} | 下次：{{ formatDateTimeShort(t.next_run_time) }}</div>
+              <div class="item-sub">
+                分组：
+                <select
+                  :value="t.group_name || ''"
+                  :disabled="groupAssignSavingTaskId===Number(t.id)"
+                  @change="quickAssignTaskGroup(t, $event.target.value)"
+                >
+                  <option value="">未分组</option>
+                  <option v-for="g in taskGroups" :key="'card-g-' + t.id + '-' + g" :value="g">{{ g }}</option>
+                </select>
+              </div>
               <div class="budget-box" v-if="t.latest_budget_summary">
                 <div class="budget-title">预算结算（{{ t.latest_budget_summary.year_month || '-' }}）</div>
                 <div class="budget-grid">
@@ -551,7 +626,13 @@
                   进度：{{ r.progress_pct || 0 }}% · {{ r.progress_stage }}
                 </div>
                 <div class="item-sub" v-if="runEndReason(r)">
-                  结束原因：{{ runEndReason(r) }}
+                  结束原因：{{ runEndReasonText(r) }}
+                </div>
+                <div class="item-sub" v-if="runDiagnosticsArtifact(r)">
+                  诊断文件：
+                  <a :href="'/api/jobs/' + r.id + '/download?file=' + encodeURIComponent(runDiagnosticsArtifact(r).filename)" target="_blank">
+                    {{ runDiagnosticsArtifact(r).filename }}
+                  </a>
                 </div>
                 <div class="progress" v-if="r.status==='running' || r.status==='pending'">
                   <div class="progress-inner" :style="{ width: (r.progress_pct || 0) + '%' }"></div>
@@ -568,6 +649,8 @@
                 </div>
               </div>
               <div class="actions">
+                <button class="btn-muted" @click="viewRunLog(r)">查看日志</button>
+                <a class="btn-muted" :href="'/api/jobs/' + r.id + '/log'" target="_blank">下载日志</a>
                 <button class="btn-danger" @click="deleteRun(r.id)">删除</button>
               </div>
             </div>
@@ -590,8 +673,18 @@
         </div>
       </section>
     </div>
+
+    <section v-if="logViewer.visible" class="edit-panel">
+      <h2>运行日志 #{{ logViewer.jobId }}</h2>
+      <div class="row">
+        <button class="btn-muted" @click="closeLogViewer">关闭</button>
+      </div>
+      <div class="meta-text" v-if="logViewer.loading">日志加载中...</div>
+      <div class="meta-text" v-if="logViewer.error">日志加载失败：{{ logViewer.error }}</div>
+      <pre v-if="!logViewer.loading && !logViewer.error" style="max-height:360px; overflow:auto; background:#111; color:#ddd; padding:12px;">{{ logViewer.content || '(日志为空)' }}</pre>
+    </section>
   </div>
-  <script src="/static/app.js?v=20260313-01"></script>
+  <script src="/static/app.js?v=20260403-01"></script>
 </body>
 </html>
 

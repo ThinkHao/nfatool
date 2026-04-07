@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     CONFIG_AUTO_ROTATE_DAYS: int = 30
     APP_VERSION: str = "0.1.0"
     GITHUB_REPO: Optional[str] = None  # owner/repo
+    GITEE_REPO: Optional[str] = None  # owner/repo; defaults to GITHUB_REPO when empty
+    GITEE_TOKEN: Optional[str] = None  # optional token for private gitee repositories
+    UPDATE_SOURCE_PRIORITY: str = "gitee,github"
     UPDATE_ASSET_LINUX: str = "nfa95"
     UPDATE_ASSET_WINDOWS: str = "nfa95.exe"
     UPDATE_CA_BUNDLE: Optional[str] = None  # custom CA bundle path for updater HTTPS

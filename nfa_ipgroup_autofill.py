@@ -8,7 +8,7 @@
 - ipgroup_name: 解析格式 "院校名称_CP名称_IP版本"（兼容 V4/V6 及 V4-1/V6-2，含中英文短横），
   填充 school_name、cp（根据 mapping.json 将显示名映射为简称）
 - region: 优先使用命令行参数；否则基于 school_name 的历史记录沿用；否则留空
-- school_id: 根据 school_name 在历史记录中沿用（取最近的非空值）
+- school_id: 优先按 school_name 在历史记录中沿用；若无历史则按全表最大纯数字 school_id + 1 分配
 - saler_group / saler: 根据 school_name 在历史记录中沿用；否则回退命令行参数；都没有留空
 
 支持 dry-run 预览以及通过 --nfa-uuid 参数限制操作范围（可逗号分隔多个）。
@@ -25,7 +25,7 @@ import logging
 import configparser
 import os
 import json
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 # 日志配置
 logging.basicConfig(
@@ -151,12 +151,12 @@ def fetch_existing_from_nfa_uuid(cursor, nfa_uuid: str) -> Dict:
     return cursor.fetchone() or {}
 
 
-def fetch_school_id_by_name(cursor, school_name: str) -> Optional[int]:
+def fetch_school_id_by_name(cursor, school_name: str) -> Optional[str]:
     cursor.execute(
         """
         SELECT school_id
         FROM nfa_ipgroup
-        WHERE school_name=%s AND school_id IS NOT NULL
+        WHERE school_name=%s AND school_id IS NOT NULL AND TRIM(school_id) <> ''
         ORDER BY update_time DESC, create_time DESC
         LIMIT 1
         """,
@@ -164,6 +164,37 @@ def fetch_school_id_by_name(cursor, school_name: str) -> Optional[int]:
     )
     row = cursor.fetchone()
     return row['school_id'] if row else None
+
+
+def fetch_max_numeric_school_id(cursor) -> int:
+    """
+    获取全表最大纯数字 school_id。
+    若存在任意非纯数字（含空字符串）school_id，直接报错终止，避免错误分配。
+    """
+    cursor.execute(
+        """
+        SELECT school_id
+        FROM nfa_ipgroup
+        WHERE school_id IS NOT NULL
+          AND school_id NOT REGEXP '^[0-9]+$'
+        LIMIT 1
+        """
+    )
+    bad = cursor.fetchone()
+    if bad:
+        bad_value = bad.get('school_id')
+        raise ValueError(f"检测到非数字 school_id: '{bad_value}'，已停止执行。请先清理数据后重试。")
+
+    cursor.execute(
+        """
+        SELECT MAX(CAST(school_id AS UNSIGNED)) AS max_school_id
+        FROM nfa_ipgroup
+        WHERE school_id IS NOT NULL
+          AND school_id REGEXP '^[0-9]+$'
+        """
+    )
+    row = cursor.fetchone() or {}
+    return int(row.get('max_school_id') or 0)
 
 
 def fetch_region_by_school(cursor, school_name: str) -> Optional[str]:
@@ -315,7 +346,12 @@ def compute_updates_for_row(row: Dict,
     return updates, empty_fields
 
 
-def apply_historical_overrides(cursor, row: Dict, updates: Dict[str, object], empty_fields: List[str], args):
+def apply_historical_overrides(cursor,
+                               row: Dict,
+                               updates: Dict[str, object],
+                               empty_fields: List[str],
+                               args,
+                               school_id_allocator: Dict[str, Any]):
     """根据历史记录（nfa_uuid、school_name）进一步完善 region / nfa_name / school_id / saler*"""
     nfa_uuid = row.get('nfa_uuid')
     # 优先使用从 ipgroup_name 解析出的 school_name 作为后续 region 查找依据
@@ -353,14 +389,34 @@ def apply_historical_overrides(cursor, row: Dict, updates: Dict[str, object], em
 
     # 不再进行 school/cp/region 维度的猜测，nfa_name 仅按 nfa_uuid 历史沿用
 
-    # school_id：按 school_name 历史沿用
+    # school_id：先按 school_name 历史沿用；若无历史则按全表最大纯数字+1分配
     if (not row.get('school_id')) and school_name:
         sid = fetch_school_id_by_name(cursor, school_name)
         if sid is not None:
-            updates['school_id'] = sid
+            updates['school_id'] = str(sid)
+            if getattr(args, 'trace_source', False):
+                logger.info(f"school_id来源[school历史] id={row.get('id')} school='{school_name}' -> '{sid}'")
         else:
-            if 'school_id' not in empty_fields:
-                empty_fields.append('school_id')
+            school_name_to_id = school_id_allocator['school_name_to_id']
+            if school_name in school_name_to_id:
+                new_sid = school_name_to_id[school_name]
+                updates['school_id'] = new_sid
+                if getattr(args, 'trace_source', False):
+                    logger.info(f"school_id来源[本次新院校复用] id={row.get('id')} school='{school_name}' -> '{new_sid}'")
+            else:
+                next_sid = int(school_id_allocator['next_school_id'])
+                new_sid = str(next_sid)
+                school_name_to_id[school_name] = new_sid
+                school_id_allocator['next_school_id'] = next_sid + 1
+                updates['school_id'] = new_sid
+                if getattr(args, 'trace_source', False):
+                    logger.info(f"school_id来源[本次新院校分配] id={row.get('id')} school='{school_name}' -> '{new_sid}'")
+
+            if 'school_id' in empty_fields:
+                try:
+                    empty_fields.remove('school_id')
+                except ValueError:
+                    pass
 
     # saler_group / saler：若仍为空且有 school_name，优先用历史；否则回退命令行参数
     if school_name:
@@ -415,6 +471,22 @@ def run(args):
     conn = connect_db(db_cfg)
     cursor = conn.cursor()
     cp_mapping = load_cp_mapping(args.mapping)
+    try:
+        max_school_id = fetch_max_numeric_school_id(cursor)
+    except ValueError as e:
+        logger.error(str(e))
+        cursor.close()
+        conn.close()
+        sys.exit(1)
+
+    school_id_allocator: Dict[str, Any] = {
+        'next_school_id': max_school_id + 1 if max_school_id > 0 else 1,
+        'school_name_to_id': {}
+    }
+    logger.info(
+        f"school_id分配器初始化完成：当前最大纯数字school_id={max_school_id}，"
+        f"新院校将从 {school_id_allocator['next_school_id']} 开始分配"
+    )
 
     # 读取目标记录
     nfa_uuid_list = parse_nfa_uuid_list(args.nfa_uuid)
@@ -437,7 +509,7 @@ def run(args):
             continue
         updates, empty_fields = compute_updates_for_row(row, cp_mapping, args)
         # 用历史数据进行二次填充
-        apply_historical_overrides(cursor, row, updates, empty_fields, args)
+        apply_historical_overrides(cursor, row, updates, empty_fields, args, school_id_allocator)
 
         # 若 region 仍为空，记录空项
         if (not row.get('region')) and ('region' not in updates):

@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ConfigDict
 
 class TaskBase(BaseModel):
     name: str
+    group_name: Optional[str] = None
     active: bool = True
     kind: Literal["one_off", "periodic"] = "one_off"
     data_source_type: Literal["nfa", "edc"] = "nfa"
@@ -32,6 +33,7 @@ class TaskCreate(TaskBase):
 
 class TaskUpdate(BaseModel):
     name: Optional[str] = None
+    group_name: Optional[str] = None
     active: Optional[bool] = None
     kind: Optional[Literal["one_off", "periodic"]] = None
     data_source_type: Optional[Literal["nfa", "edc"]] = None
@@ -45,6 +47,20 @@ class TaskUpdate(BaseModel):
     params: Optional[dict[str, Any]] = None
     export_formats: Optional[list[Literal["csv", "xlsx"]]] = None
     output_filename_template: Optional[str] = None
+
+
+class TaskGroupCreate(BaseModel):
+    name: str
+
+
+class TaskGroupRename(BaseModel):
+    old_name: str
+    new_name: str
+    merge: bool = False
+
+
+class TaskGroupAssign(BaseModel):
+    group_name: Optional[str] = None
 
 
 class TaskOut(TaskBase):
