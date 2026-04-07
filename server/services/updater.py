@@ -39,6 +39,50 @@ def _resolve_update_target() -> Path:
     return Path(os.path.abspath("nfa95"))
 
 
+def _resolve_current_version_from_state() -> str | None:
+    try:
+        s = get_settings()
+        target = _resolve_update_target()
+        state_path = _resolve_runner_state(s, target)
+        state = _read_runner_state(state_path)
+        if str(state.get("status") or "").strip().lower() != "succeeded":
+            return None
+        ver = str(state.get("version") or "").strip()
+        return ver or None
+    except Exception:
+        return None
+
+
+def _resolve_current_version_from_target_path() -> str | None:
+    try:
+        target = _resolve_update_target()
+        chain = [
+            str(target),
+            str(target.resolve(strict=False)),
+        ]
+        for raw in chain:
+            # Match ".../releases/<tag>-<timestamp>/..."
+            m = re.search(r"(?:^|[\\/])releases[\\/](v[^\\/]+?)-\d{14}(?:[\\/]|$)", raw)
+            if m:
+                ver = str(m.group(1) or "").strip()
+                if ver:
+                    return ver
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_current_version() -> tuple[str, str]:
+    s = get_settings()
+    by_state = _resolve_current_version_from_state()
+    if by_state:
+        return by_state, "state_file"
+    by_path = _resolve_current_version_from_target_path()
+    if by_path:
+        return by_path, "target_path"
+    return str(s.APP_VERSION or "0.0.0"), "env_app_version"
+
+
 def _norm_ver(v: str) -> tuple[int, ...]:
     s = str(v or "").strip()
     if s.startswith("v"):
@@ -166,7 +210,7 @@ def _check_update_from_gitee(current: str, repo: str, asset_name: str, token: st
 
 def check_update() -> dict[str, Any]:
     s = get_settings()
-    current = s.APP_VERSION or "0.0.0"
+    current, current_source = _resolve_current_version()
     asset_name = _pick_asset_name()
     gitee_repo = str((getattr(s, "GITEE_REPO", None) or s.GITHUB_REPO or "")).strip()
     github_repo = str(s.GITHUB_REPO or "").strip()
@@ -179,11 +223,15 @@ def check_update() -> dict[str, Any]:
             if source == "gitee":
                 if not gitee_repo:
                     raise ValueError("GITEE_REPO/GITHUB_REPO is not configured")
-                return _check_update_from_gitee(current, gitee_repo, asset_name, gitee_token)
+                out = _check_update_from_gitee(current, gitee_repo, asset_name, gitee_token)
+                out["current_version_source"] = current_source
+                return out
             if source == "github":
                 if not github_repo:
                     raise ValueError("GITHUB_REPO is not configured")
-                return _check_update_from_github(current, github_repo, asset_name)
+                out = _check_update_from_github(current, github_repo, asset_name)
+                out["current_version_source"] = current_source
+                return out
         except Exception as e:
             msg = str(e)
             if "CERTIFICATE_VERIFY_FAILED" in msg or "certificate verify failed" in msg.lower():
@@ -196,6 +244,7 @@ def check_update() -> dict[str, Any]:
     return {
         "ok": False,
         "current_version": current,
+        "current_version_source": current_source,
         "asset_name": asset_name,
         "message": message,
         "errors": errors,

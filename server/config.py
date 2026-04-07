@@ -15,9 +15,13 @@ import sys
 
 
 def _app_base_dir() -> Path:
-    # If packaged by PyInstaller --onefile, use the executable directory
+    # If packaged by PyInstaller --onefile, prefer argv[0] so symlink launch
+    # paths (for example /home/nfa95/nfa95) remain stable across releases.
     if getattr(sys, 'frozen', False):
-        return Path(sys.executable).resolve().parent
+        argv0 = str((getattr(sys, "argv", None) or [""])[0] or "").strip()
+        if argv0:
+            return Path(argv0).absolute().parent
+        return Path(sys.executable).absolute().parent
     return Path(__file__).resolve().parent
 
 

@@ -121,64 +121,78 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sync Gitee Release Assets
-        if: startsWith(github.ref, 'refs/tags/') && secrets.GITEE_TOKEN != ''
+        id: sync_gitee_release_assets
+        timeout-minutes: 6
+        continue-on-error: true
         shell: bash
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          GITEE_OWNER: ${{ vars.GITEE_OWNER }}
-          GITEE_REPO: ${{ vars.GITEE_REPO }}
         run: |
           set -euo pipefail
+          if [[ "${GITHUB_REF:-}" != refs/tags/* ]]; then
+            echo "[gitee] not a tag push, skip syncing."
+            exit 0
+          fi
+          if [[ -z "${GITEE_TOKEN:-}" ]]; then
+            echo "[gitee] GITEE_TOKEN is empty, skip syncing."
+            exit 0
+          fi
           TAG_NAME="${GITHUB_REF_NAME}"
-          OWNER="${GITEE_OWNER:-${GITHUB_REPOSITORY_OWNER}}"
-          REPO="${GITEE_REPO:-${GITHUB_REPOSITORY#*/}}"
+          OWNER="ThinkHao"
+          REPO="nfatool"
           API_BASE="https://gitee.com/api/v5/repos/${OWNER}/${REPO}"
+          API_CURL_OPTS=(--connect-timeout 15 --max-time 120 --retry 5 --retry-delay 2 --retry-connrefused)
+          UPLOAD_CURL_OPTS=(--connect-timeout 20 --max-time 600 --retry 5 --retry-delay 3 --retry-connrefused --retry-all-errors)
+          UPLOAD_CURL_OPTS_EXE=(--connect-timeout 20 --max-time 180 --retry 1 --retry-delay 2 --retry-connrefused --retry-all-errors)
 
           echo "[gitee] target repo: ${OWNER}/${REPO}, tag: ${TAG_NAME}"
+
+          curl_api() {
+            curl "${API_CURL_OPTS[@]}" -sS "$@"
+          }
+
+          curl_upload() {
+            curl "${UPLOAD_CURL_OPTS[@]}" -sS "$@"
+          }
+
+          curl_upload_exe() {
+            curl "${UPLOAD_CURL_OPTS_EXE[@]}" -sS "$@"
+          }
 
           parse_json_field() {
             local key="$1"
             local raw="$2"
-            python - "$key" "$raw" <<'PY'
-import json
-import sys
-key = sys.argv[1]
-raw = sys.argv[2]
-obj = json.loads(raw or "{}")
-val = obj.get(key)
-print("" if val is None else str(val))
-PY
+            python -c "import json,sys; obj=json.loads(sys.argv[2] or 'null'); obj=obj if isinstance(obj, dict) else {}; v=obj.get(sys.argv[1]); print('' if v is None else str(v))" "$key" "$raw"
           }
 
           parse_asset_id_by_name() {
             local name="$1"
             local raw="$2"
-            python - "$name" "$raw" <<'PY'
-import json
-import sys
-target = sys.argv[1]
-raw = sys.argv[2]
-obj = json.loads(raw or "[]")
-if isinstance(obj, dict):
-    obj = obj.get("assets") or obj.get("attach_files") or []
-for item in obj or []:
-    if str(item.get("name") or "") == target:
-        print(item.get("id") or "")
-        break
-PY
+            python -c "import json,sys; target=sys.argv[1]; obj=json.loads(sys.argv[2] or 'null'); obj=(obj.get('assets') or obj.get('attach_files') or []) if isinstance(obj, dict) else (obj if isinstance(obj, list) else []); print(next((str((x or {}).get('id') or '') for x in obj if isinstance(x, dict) and str(x.get('name') or '')==target), ''))" "$name" "$raw"
           }
 
           # 1) resolve release id by tag; create if not exists
-          release_resp="$(curl -sS -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
+          release_resp="$(curl_api -w $'\n%{http_code}' "${API_BASE}/releases/tags/${TAG_NAME}?access_token=${GITEE_TOKEN}")"
           release_body="$(echo "${release_resp}" | sed '$d')"
           release_code="$(echo "${release_resp}" | tail -n1)"
+          release_id=""
 
           if [[ "${release_code}" == "200" ]]; then
             release_id="$(parse_json_field id "${release_body}")"
           elif [[ "${release_code}" == "404" ]]; then
-            create_resp="$(curl -sS -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
+            release_id=""
+          else
+            echo "[gitee] fetch release failed: HTTP ${release_code}"
+            echo "${release_body}"
+            exit 1
+          fi
+
+          if [[ -z "${release_id}" ]]; then
+            echo "[gitee] release not found by tag, creating one..."
+            create_resp="$(curl_api -w $'\n%{http_code}' -X POST "${API_BASE}/releases" \
               -d "access_token=${GITEE_TOKEN}" \
               -d "tag_name=${TAG_NAME}" \
+              -d "target_commitish=main" \
               -d "name=${TAG_NAME}" \
               -d "body=Synced from GitHub Actions run ${GITHUB_RUN_ID}")"
             create_body="$(echo "${create_resp}" | sed '$d')"
@@ -189,10 +203,6 @@ PY
               exit 1
             fi
             release_id="$(parse_json_field id "${create_body}")"
-          else
-            echo "[gitee] fetch release failed: HTTP ${release_code}"
-            echo "${release_body}"
-            exit 1
           fi
 
           if [[ -z "${release_id}" ]]; then
@@ -202,15 +212,40 @@ PY
           echo "[gitee] release id: ${release_id}"
 
           # 2) replace assets with same name, then upload new files
-          attach_list="$(curl -sS "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
-          for file in artifacts/windows/nfa95.exe artifacts/linux/nfa95 server/.env.example; do
+          echo "[gitee] fetch existing assets list..."
+          attach_list="$(curl_api "${API_BASE}/releases/${release_id}/attach_files?access_token=${GITEE_TOKEN}")"
+          for file in artifacts/linux/nfa95 server/.env.example artifacts/windows/nfa95.exe; do
             name="$(basename "${file}")"
+            echo "[gitee] syncing asset: ${name}"
             existing_id="$(parse_asset_id_by_name "${name}" "${attach_list}")"
             if [[ -n "${existing_id}" ]]; then
-              curl -sS -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
+              echo "[gitee] deleting existing asset id=${existing_id} (${name})"
+              curl_api -X DELETE "${API_BASE}/releases/${release_id}/attach_files/${existing_id}?access_token=${GITEE_TOKEN}" >/dev/null
             fi
-            curl -sS -X POST "${API_BASE}/releases/${release_id}/attach_files" \
-              -F "access_token=${GITEE_TOKEN}" \
-              -F "file=@${file}" >/dev/null
+            echo "[gitee] uploading ${name} ..."
+            if [[ "${name}" == "nfa95.exe" ]]; then
+              if ! curl_upload_exe -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+                -H "Expect:" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${file}" >/dev/null; then
+                echo "[gitee] WARN: upload ${name} failed; continue without blocking release."
+                continue
+              fi
+            else
+              curl_upload -X POST "${API_BASE}/releases/${release_id}/attach_files" \
+                -H "Expect:" \
+                -F "access_token=${GITEE_TOKEN}" \
+                -F "file=@${file}" >/dev/null
+            fi
             echo "[gitee] uploaded ${name}"
           done
+
+      - name: Gitee Sync Summary
+        if: always()
+        shell: bash
+        run: |
+          if [[ "${{ steps.sync_gitee_release_assets.outcome }}" == "success" ]]; then
+            echo "[gitee] sync step succeeded."
+          else
+            echo "[gitee] WARN: sync step failed or timed out; GitHub release is still available."
+          fi
