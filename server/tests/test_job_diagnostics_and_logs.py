@@ -26,6 +26,7 @@ if "paramiko" not in sys.modules:
 
 from server.services import compute95
 from server.services.compute95 import _export_df, _make_terminal_no_data_artifacts
+from server.services.unit_conversion import mbps_to_raw
 
 
 def _reload_runtime(monkeypatch, tmp_path: Path):
@@ -106,6 +107,120 @@ def test_export_df_empty_adds_empty_result_diagnostics(monkeypatch, tmp_path):
     assert "empty-demo-diagnostics.json" in names
     marker = next(x for x in artifacts if x["filename"].endswith("-empty_result.txt"))
     assert marker["terminal_code"] == "EMPTY_RESULT"
+
+
+def test_export_df_nfa_daily_formats_flow_and_adds_raw_column(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([
+        {"ipgroup_name": "A", "daily_95th_percentile_mbps": 9329.581960042318},
+    ])
+    artifacts = _export_df(
+        df,
+        "job-nfa-daily",
+        "nfa-daily",
+        ["csv"],
+        flow_context={"source_type": "nfa", "unit_base": 1024},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path, dtype=str)
+
+    assert "daily_95th_percentile_mbps" in out_df.columns
+    assert "daily_95th_percentile_raw" in out_df.columns
+    assert out_df.columns.get_loc("daily_95th_percentile_raw") < out_df.columns.get_loc("daily_95th_percentile_mbps")
+    assert out_df.loc[0, "daily_95th_percentile_mbps"] == "9329.582"
+    expected_raw = f"{mbps_to_raw(9329.581960042318, 1024, 60):.3f}"
+    assert out_df.loc[0, "daily_95th_percentile_raw"] == expected_raw
+
+
+def test_export_df_nfa_period_formats_flow_and_adds_raw_column(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([
+        {"ipgroup_name": "A", "95th_percentile_mbps": 18847.703043619793},
+    ])
+    artifacts = _export_df(
+        df,
+        "job-nfa-period",
+        "nfa-period",
+        ["csv"],
+        flow_context={"source_type": "nfa", "unit_base": 1024},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path, dtype=str)
+
+    assert "95th_percentile_mbps" in out_df.columns
+    assert "95th_percentile_raw" in out_df.columns
+    assert out_df.columns.get_loc("95th_percentile_raw") < out_df.columns.get_loc("95th_percentile_mbps")
+    assert out_df.loc[0, "95th_percentile_mbps"] == "18847.703"
+    expected_raw = f"{mbps_to_raw(18847.703043619793, 1024, 60):.3f}"
+    assert out_df.loc[0, "95th_percentile_raw"] == expected_raw
+
+
+def test_export_df_edc_keeps_existing_raw_value_and_only_formats(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([
+        {
+            "edc_name": "x",
+            "daily_95th_percentile_mbps": 1.0,
+            "daily_95th_percentile_raw": 999.0,
+        },
+    ])
+    artifacts = _export_df(
+        df,
+        "job-edc",
+        "edc-daily",
+        ["csv"],
+        flow_context={"source_type": "edc", "unit_base": 1024},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path, dtype=str)
+
+    assert out_df.loc[0, "daily_95th_percentile_mbps"] == "1.000"
+    assert out_df.loc[0, "daily_95th_percentile_raw"] == "999.000"
+
+
+def test_export_df_flow_format_tolerates_empty_and_invalid_values(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([
+        {"95th_percentile_mbps": None},
+        {"95th_percentile_mbps": "abc"},
+        {"95th_percentile_mbps": float("nan")},
+        {"95th_percentile_mbps": 1.2},
+    ])
+    artifacts = _export_df(
+        df,
+        "job-invalid",
+        "invalid-flow",
+        ["csv"],
+        flow_context={"source_type": "nfa", "unit_base": 1024},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+
+    assert out_df.loc[0, "95th_percentile_mbps"] == ""
+    assert out_df.loc[1, "95th_percentile_mbps"] == ""
+    assert out_df.loc[2, "95th_percentile_mbps"] == ""
+    assert out_df.loc[3, "95th_percentile_mbps"] == "1.200"
+
+    assert out_df.loc[0, "95th_percentile_raw"] == ""
+    assert out_df.loc[1, "95th_percentile_raw"] == ""
+    assert out_df.loc[2, "95th_percentile_raw"] == ""
+    assert out_df.loc[3, "95th_percentile_raw"] != ""
 
 
 def test_job_log_tail_api(monkeypatch, tmp_path):

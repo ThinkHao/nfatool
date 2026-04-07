@@ -632,6 +632,7 @@ def _compute_edc_and_export(
                     "key_params": {"edc_name": edc_name, "monthly_aggregate": True},
                     "counters": {"months": len(month_ranges)},
                 },
+                flow_context={"source_type": "edc", "unit_base": unit_base},
             )
 
         if export_daily:
@@ -652,6 +653,7 @@ def _compute_edc_and_export(
                     "key_params": {"edc_name": edc_name, "export_daily": True},
                     "counters": {"daily_days": len(daily_rows)},
                 },
+                flow_context={"source_type": "edc", "unit_base": unit_base},
             )
 
         if settlement_mode == "daily_95_avg":
@@ -688,6 +690,7 @@ def _compute_edc_and_export(
                 "key_params": {"edc_name": edc_name, "settlement_mode": settlement_mode},
                 "counters": {"full_rows": len(full_rows)},
             },
+            flow_context={"source_type": "edc", "unit_base": unit_base},
         )
     finally:
         try:
@@ -788,6 +791,56 @@ def _make_terminal_artifacts(
     ]
 
 
+def _normalize_flow_columns_for_export(
+    df: pd.DataFrame,
+    flow_context: Dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    ctx = flow_context or {}
+    source_type = str(ctx.get("source_type") or "nfa").strip().lower()
+    unit_base = int(ctx.get("unit_base") or 1024)
+    if unit_base not in (1000, 1024):
+        unit_base = 1024
+    seconds_per_point = 300.0 if source_type == "edc" else 60.0
+
+    def _fmt_3(v: Any) -> str:
+        try:
+            if pd.isna(v):
+                return ""
+        except Exception:
+            pass
+        try:
+            return f"{float(v):.3f}"
+        except Exception:
+            return ""
+
+    out = df.copy()
+    flow_col_pairs = (
+        ("daily_95th_percentile_mbps", "daily_95th_percentile_raw"),
+        ("95th_percentile_mbps", "95th_percentile_raw"),
+    )
+    for mbps_col, raw_col in flow_col_pairs:
+        if mbps_col in out.columns and raw_col not in out.columns:
+            mbps_series = pd.to_numeric(out[mbps_col], errors="coerce")
+            out[raw_col] = mbps_series.map(
+                lambda x: mbps_to_raw(float(x), unit_base, seconds_per_point) if pd.notna(x) else None
+            )
+        if mbps_col in out.columns:
+            out[mbps_col] = out[mbps_col].map(_fmt_3)
+        if raw_col in out.columns:
+            out[raw_col] = out[raw_col].map(_fmt_3)
+
+    cols = list(out.columns)
+    for mbps_col, raw_col in flow_col_pairs:
+        if mbps_col in cols and raw_col in cols:
+            cols = [c for c in cols if c != raw_col]
+            cols.insert(cols.index(mbps_col), raw_col)
+    out = out.loc[:, cols]
+    return out
+
+
 def _export_df(
     df: pd.DataFrame,
     job_id: str,
@@ -795,6 +848,7 @@ def _export_df(
     export_formats: List[str],
     *,
     empty_terminal: Dict[str, Any] | None = None,
+    flow_context: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     artifacts: List[Dict[str, Any]] = []
     if df is None:
@@ -835,6 +889,7 @@ def _export_df(
             )
         )
         return artifacts
+    df = _normalize_flow_columns_for_export(df, flow_context=flow_context)
     if "csv" in export_formats:
         p = safe_artifact_path(job_id, f"{filename_noext}.csv")
         export_csv(df, p)
@@ -1250,6 +1305,7 @@ def compute_and_export(
                     f"NFA 按月聚合结果为空：省份={province}，CP={cp}，窗口={window_label}",
                     {"matched_schools": len(schools), "months": len(month_ranges)},
                 ),
+                flow_context={"source_type": "nfa", "unit_base": unit_base},
             )
             return artifacts
 
@@ -1304,6 +1360,7 @@ def compute_and_export(
                         f"NFA 排除组结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"excluded_schools": len(excluded_schools)},
                     ),
+                    flow_context={"source_type": "nfa", "unit_base": unit_base},
                 )
 
             # 2) 剩余组（整体汇总）
@@ -1418,6 +1475,7 @@ def compute_and_export(
                             f"NFA 剩余组结果为空：省份={province}，CP={cp}，窗口={window_label}",
                             {"remaining_schools": len(remaining_schools)},
                         ),
+                        flow_context={"source_type": "nfa", "unit_base": unit_base},
                     )
             return artifacts
         else:
@@ -1466,6 +1524,7 @@ def compute_and_export(
                         f"NFA 汇总结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"matched_schools": len(schools), "aggregate_all": True},
                     ),
+                    flow_context={"source_type": "nfa", "unit_base": unit_base},
                 )
                 return artifacts
             else:
@@ -1597,6 +1656,7 @@ def compute_and_export(
                         f"NFA 产物结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"matched_schools": len(schools)},
                     ),
+                    flow_context={"source_type": "nfa", "unit_base": unit_base},
                 )
                 return artifacts
     finally:
