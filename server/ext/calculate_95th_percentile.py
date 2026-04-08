@@ -817,6 +817,14 @@ def save_results(results, output_path, is_daily, direction, start_time, end_time
         logger.warning(f"{extra_log_prefix}没有计算任何结果，跳过写入文件。")
         return
     df_final_results = pd.DataFrame(results)
+    def _split_ipgroup_name(value):
+        name = str(value or '').strip()
+        lowered = name.lower()
+        if lowered.endswith('_v4'):
+            return name[:-3], 0
+        if lowered.endswith('_v6'):
+            return name[:-3], 1
+        return name, 2
     # 如需排序则按指定字段排序
     if sort_by:
         if sort_by in df_final_results.columns:
@@ -828,6 +836,24 @@ def save_results(results, output_path, is_daily, direction, start_time, end_time
                 logger.warning(f"{extra_log_prefix}按字段 '{sort_by}' 排序失败：{e}，将保持原顺序。")
         else:
             logger.warning(f"{extra_log_prefix}指定的排序字段 '{sort_by}' 不存在，将保持原顺序。可用字段：{', '.join(df_final_results.columns)}")
+    elif 'ipgroup_name' in df_final_results.columns:
+        try:
+            school_sort = df_final_results['ipgroup_name'].apply(_split_ipgroup_name)
+            df_final_results = df_final_results.assign(
+                _school_sort_key=school_sort.map(lambda x: x[0]),
+                _school_variant_rank=school_sort.map(lambda x: x[1]),
+            )
+            sort_columns = ['_school_sort_key', '_school_variant_rank', 'ipgroup_name']
+            if 'date' in df_final_results.columns:
+                sort_columns.append('date')
+            if 'month' in df_final_results.columns:
+                sort_columns.append('month')
+            df_final_results = df_final_results.sort_values(by=sort_columns, ascending=True).drop(
+                columns=['_school_sort_key', '_school_variant_rank']
+            )
+            logger.info(f"{extra_log_prefix}未指定排序字段，已按学校名称对导出结果进行默认排序。")
+        except Exception as e:
+            logger.warning(f"{extra_log_prefix}默认学校名称排序失败：{e}，将保持原顺序。")
     df_final_results.to_csv(output_path, index=False, encoding='utf-8-sig')
     if is_daily:
         logger.info(f"{extra_log_prefix}每日95值结果已保存到 {output_path}")

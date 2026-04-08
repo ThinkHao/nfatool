@@ -27,6 +27,7 @@ if "paramiko" not in sys.modules:
 from server.services import compute95
 from server.services.compute95 import _export_df, _make_terminal_no_data_artifacts
 from server.services.unit_conversion import mbps_to_raw
+from server.ext.calculate_95th_percentile import save_results
 
 
 def _reload_runtime(monkeypatch, tmp_path: Path):
@@ -221,6 +222,33 @@ def test_export_df_flow_format_tolerates_empty_and_invalid_values(monkeypatch, t
     assert out_df.loc[1, "95th_percentile_raw"] == ""
     assert out_df.loc[2, "95th_percentile_raw"] == ""
     assert out_df.loc[3, "95th_percentile_raw"] != ""
+
+
+def test_save_results_default_sort_groups_v4_v6_by_school_name(tmp_path):
+    output_path = tmp_path / "grouped.csv"
+    results = [
+        {"ipgroup_name": "Beta_V6", "95th_percentile_mbps": 4.0},
+        {"ipgroup_name": "Alpha_V6", "95th_percentile_mbps": 3.0},
+        {"ipgroup_name": "Beta_V4", "95th_percentile_mbps": 2.0},
+        {"ipgroup_name": "Alpha_V4", "95th_percentile_mbps": 1.0},
+    ]
+
+    save_results(
+        results,
+        str(output_path),
+        is_daily=False,
+        direction="recv",
+        start_time="2026-01-01 00:00:00",
+        end_time="2026-01-31 23:59:59",
+    )
+
+    out_df = pd.read_csv(output_path, dtype=str)
+    assert out_df["ipgroup_name"].tolist() == [
+        "Alpha_V4",
+        "Alpha_V6",
+        "Beta_V4",
+        "Beta_V6",
+    ]
 
 
 def test_job_log_tail_api(monkeypatch, tmp_path):
