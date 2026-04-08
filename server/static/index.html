@@ -316,8 +316,8 @@
           <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合导出</label>
 
           <template v-if="newTask.data_source_type==='nfa'">
-            <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" /> V4/V6累加</label>
-            <select v-model="newTask.params.merge_key">
+            <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" @change="onCombineV4V6Toggle(newTask)" /> V4/V6累加</label>
+            <select v-model="newTask.params.merge_key" :disabled="!newTask.params.combine_v4_v6">
               <option value="">合并键：不合并</option>
               <option value="ipgroup_name_base">按名称去后缀(_V4/_V6)</option>
               <option value="ipgroup_name">按IP组名称</option>
@@ -429,8 +429,8 @@
         <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合导出</label>
 
         <template v-if="editTask.data_source_type==='nfa'">
-          <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" /> V4/V6累加</label>
-          <select v-model="editTask.params.merge_key">
+          <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" @change="onCombineV4V6Toggle(editTask)" /> V4/V6累加</label>
+          <select v-model="editTask.params.merge_key" :disabled="!editTask.params.combine_v4_v6">
             <option value="">合并键：不合并</option>
             <option value="ipgroup_name_base">按名称去后缀(_V4/_V6)</option>
             <option value="ipgroup_name">按IP组名称</option>

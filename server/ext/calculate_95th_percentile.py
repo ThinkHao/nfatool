@@ -428,9 +428,12 @@ def process_schools_batched(connection, schools, start_time, end_time, direction
             return n[:-3]
         return n
 
-    # 兼容：若 merge_key 未指定而 combine_v4_v6=True，则等价于 merge_key='ipgroup_name_base'
+    # combine_v4_v6 是唯一合并开关：关闭时强制不合并（忽略 merge_key）
     eff_merge_key = (merge_key or '').strip().lower()
-    if not eff_merge_key and combine_v4_v6:
+    if not combine_v4_v6:
+        eff_merge_key = ''
+    elif not eff_merge_key:
+        # 兼容：仅在开关开启且 merge_key 未指定时，默认按名称去后缀合并
         eff_merge_key = 'ipgroup_name_base'
 
     if eff_merge_key:

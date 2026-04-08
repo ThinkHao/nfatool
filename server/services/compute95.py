@@ -1022,7 +1022,12 @@ def compute_and_export(
         unit_base = 1024
     settlement_mode = params.get("settlement_mode")  # None -> preserve prior behavior
     combine_v4_v6 = bool(params.get("combine_v4_v6", False))
-    merge_key = params.get("merge_key")
+    merge_key_raw = params.get("merge_key")
+    merge_key = str(merge_key_raw).strip() if merge_key_raw is not None else ""
+    if not combine_v4_v6:
+        merge_key = ""
+    if not merge_key:
+        merge_key = None
     monthly_aggregate = bool(params.get("monthly_aggregate", False))
 
     # Prefer selected NFA instance config; fallback to db_config.ini if provided in params

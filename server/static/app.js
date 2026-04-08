@@ -577,6 +577,14 @@ createApp({
       }
       this.normalizeSourceParams(obj)
     },
+    onCombineV4V6Toggle(obj) {
+      if (!obj || !obj.params) return
+      const p = obj.params
+      p.combine_v4_v6 = !!p.combine_v4_v6
+      if (!p.combine_v4_v6) {
+        p.merge_key = ''
+      }
+    },
     defaultTaskParams() {
       return {
         direction: 'both',
@@ -629,6 +637,9 @@ createApp({
         if (!p.direction) p.direction = 'both'
         if (typeof p.aggregate_all !== 'boolean') p.aggregate_all = false
         if (typeof p.combine_v4_v6 !== 'boolean') p.combine_v4_v6 = false
+        if (typeof p.merge_key !== 'string') p.merge_key = p.merge_key == null ? '' : String(p.merge_key)
+        p.merge_key = p.merge_key.trim()
+        if (!p.combine_v4_v6) p.merge_key = ''
         if (!p.batch_size || Number(p.batch_size) < 10) p.batch_size = 200
         delete p.edc_name
         delete p.data_budget_enabled
