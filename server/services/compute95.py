@@ -841,6 +841,61 @@ def _normalize_flow_columns_for_export(
     return out
 
 
+def _apply_default_export_sort(
+    df: pd.DataFrame,
+    flow_context: Dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    ctx = flow_context or {}
+    source_type = str(ctx.get("source_type") or "nfa").strip().lower()
+    explicit_sort_by = str(ctx.get("sort_by") or "").strip()
+    combine_v4_v6 = bool(ctx.get("combine_v4_v6", True))
+
+    if source_type != "nfa" or explicit_sort_by or combine_v4_v6:
+        return df
+
+    out = df.copy()
+
+    def _split_variant(value: Any) -> tuple[str, int, str]:
+        name = str(value or "").strip()
+        lowered = name.lower()
+        if lowered.endswith("_v4"):
+            return name[:-3], 0, name
+        if lowered.endswith("_v6"):
+            return name[:-3], 1, name
+        return name, 2, name
+
+    label_col = None
+    if "school_icipgroup_name" in out.columns:
+        label_col = "school_icipgroup_name"
+    elif "ipgroup_name" in out.columns:
+        label_col = "ipgroup_name"
+
+    if not label_col:
+        return out
+
+    label_sort = out[label_col].map(lambda v: str(v or "").strip())
+    variant_source = out["ipgroup_name"] if "ipgroup_name" in out.columns else out[label_col]
+    variant_sort = variant_source.map(_split_variant)
+    out = out.assign(
+        _school_sort_key=label_sort,
+        _variant_base=variant_sort.map(lambda x: x[0]),
+        _variant_rank=variant_sort.map(lambda x: x[1]),
+        _variant_name=variant_sort.map(lambda x: x[2]),
+    )
+
+    sort_columns = ["_school_sort_key", "_variant_base", "_variant_rank", "_variant_name"]
+    if "date" in out.columns:
+        sort_columns.append("date")
+    if "month" in out.columns:
+        sort_columns.append("month")
+
+    out = out.sort_values(by=sort_columns, ascending=True, kind="stable")
+    return out.drop(columns=["_school_sort_key", "_variant_base", "_variant_rank", "_variant_name"])
+
+
 def _export_df(
     df: pd.DataFrame,
     job_id: str,
@@ -889,6 +944,7 @@ def _export_df(
             )
         )
         return artifacts
+    df = _apply_default_export_sort(df, flow_context=flow_context)
     df = _normalize_flow_columns_for_export(df, flow_context=flow_context)
     if "csv" in export_formats:
         p = safe_artifact_path(job_id, f"{filename_noext}.csv")
@@ -1310,7 +1366,12 @@ def compute_and_export(
                     f"NFA 按月聚合结果为空：省份={province}，CP={cp}，窗口={window_label}",
                     {"matched_schools": len(schools), "months": len(month_ranges)},
                 ),
-                flow_context={"source_type": "nfa", "unit_base": unit_base},
+                flow_context={
+                    "source_type": "nfa",
+                    "unit_base": unit_base,
+                    "sort_by": sortby,
+                    "combine_v4_v6": combine_v4_v6,
+                },
             )
             return artifacts
 
@@ -1365,7 +1426,12 @@ def compute_and_export(
                         f"NFA 排除组结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"excluded_schools": len(excluded_schools)},
                     ),
-                    flow_context={"source_type": "nfa", "unit_base": unit_base},
+                    flow_context={
+                        "source_type": "nfa",
+                        "unit_base": unit_base,
+                        "sort_by": sortby,
+                        "combine_v4_v6": combine_v4_v6,
+                    },
                 )
 
             # 2) 剩余组（整体汇总）
@@ -1480,7 +1546,12 @@ def compute_and_export(
                             f"NFA 剩余组结果为空：省份={province}，CP={cp}，窗口={window_label}",
                             {"remaining_schools": len(remaining_schools)},
                         ),
-                        flow_context={"source_type": "nfa", "unit_base": unit_base},
+                        flow_context={
+                            "source_type": "nfa",
+                            "unit_base": unit_base,
+                            "sort_by": sortby,
+                            "combine_v4_v6": combine_v4_v6,
+                        },
                     )
             return artifacts
         else:
@@ -1529,7 +1600,12 @@ def compute_and_export(
                         f"NFA 汇总结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"matched_schools": len(schools), "aggregate_all": True},
                     ),
-                    flow_context={"source_type": "nfa", "unit_base": unit_base},
+                    flow_context={
+                        "source_type": "nfa",
+                        "unit_base": unit_base,
+                        "sort_by": sortby,
+                        "combine_v4_v6": combine_v4_v6,
+                    },
                 )
                 return artifacts
             else:
@@ -1661,7 +1737,12 @@ def compute_and_export(
                         f"NFA 产物结果为空：省份={province}，CP={cp}，窗口={window_label}",
                         {"matched_schools": len(schools)},
                     ),
-                    flow_context={"source_type": "nfa", "unit_base": unit_base},
+                    flow_context={
+                        "source_type": "nfa",
+                        "unit_base": unit_base,
+                        "sort_by": sortby,
+                        "combine_v4_v6": combine_v4_v6,
+                    },
                 )
                 return artifacts
     finally:

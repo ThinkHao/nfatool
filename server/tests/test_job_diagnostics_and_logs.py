@@ -251,6 +251,43 @@ def test_save_results_default_sort_groups_v4_v6_by_school_name(tmp_path):
     ]
 
 
+def test_export_df_default_sort_groups_nfa_daily_v4_v6_rows(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([
+        {"school_icipgroup_name": "南京理工大学_B站", "ipgroup_name": "南京理工大学_B站_V6", "date": "2025-12-01", "daily_95th_percentile_mbps": 1.0},
+        {"school_icipgroup_name": "南京理工大学_B站", "ipgroup_name": "南京理工大学_B站_V4", "date": "2025-12-01", "daily_95th_percentile_mbps": 2.0},
+        {"school_icipgroup_name": "南京理工大学_B站", "ipgroup_name": "南京理工大学_B站_V6", "date": "2025-12-02", "daily_95th_percentile_mbps": 3.0},
+        {"school_icipgroup_name": "南京理工大学_B站", "ipgroup_name": "南京理工大学_B站_V4", "date": "2025-12-02", "daily_95th_percentile_mbps": 4.0},
+    ])
+
+    artifacts = _export_df(
+        df,
+        "job-sort-daily",
+        "nfa-daily-sort",
+        ["csv"],
+        flow_context={"source_type": "nfa", "unit_base": 1024, "combine_v4_v6": False},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path, dtype=str)
+
+    assert out_df["ipgroup_name"].tolist() == [
+        "南京理工大学_B站_V4",
+        "南京理工大学_B站_V4",
+        "南京理工大学_B站_V6",
+        "南京理工大学_B站_V6",
+    ]
+    assert out_df["date"].tolist() == [
+        "2025-12-01",
+        "2025-12-02",
+        "2025-12-01",
+        "2025-12-02",
+    ]
+
+
 def test_job_log_tail_api(monkeypatch, tmp_path):
     if TestClient is None:
         pytest.skip("fastapi is not installed")
