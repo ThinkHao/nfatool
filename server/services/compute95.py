@@ -246,6 +246,71 @@ def _edc_like_pattern(edc_name: str, wildcard_mode: str) -> tuple[str, str]:
     return f"{edc_name}%", "LIKE"
 
 
+# Upper bound on distinct names accepted in a single multi-value (IN) match.
+# A handful of exact names stay index-friendly equality probes; a huge IN list can
+# bloat the SQL text and push the optimizer toward a full scan, so we refuse it early.
+EDC_MAX_NAMES = 500
+
+
+def _parse_edc_names(edc_name: str) -> list[str]:
+    """Split a user-supplied edc_name into one or more names.
+
+    Names may be separated by commas or newlines so the UI can keep a single text
+    field while still expressing "exactly these N nodes". Whitespace is trimmed and
+    blanks dropped; order is preserved with duplicates removed.
+    """
+    raw = re.split(r"[,\n]", edc_name or "")
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in raw:
+        t = tok.strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _edc_name_predicate(name_col: str, edc_name: str, wildcard_mode: str) -> tuple[str, list[str]]:
+    """Build the SQL WHERE fragment + args matching one or more edc names.
+
+    - Equality tokens are grouped into a single ``IN (...)`` (or ``=`` when there is
+      just one) so a list of exact names becomes one index-friendly predicate.
+    - Glob/prefix tokens stay as ``LIKE`` and are OR-ed in.
+    A single name reproduces the original ``= %s`` / ``LIKE %s`` behavior exactly.
+    """
+    names = _parse_edc_names(edc_name)
+    if not names:
+        raise ValueError("edc_name is required in params when data_source_type=edc")
+    if len(names) > EDC_MAX_NAMES:
+        raise ValueError(f"too many edc names: {len(names)} > {EDC_MAX_NAMES}")
+
+    eq_vals: list[str] = []
+    like_frags: list[str] = []
+    like_args: list[str] = []
+    for tok in names:
+        pattern, op = _edc_like_pattern(tok, wildcard_mode)
+        if op == "=":
+            eq_vals.append(pattern)
+        else:
+            like_frags.append(f"{name_col} LIKE %s")
+            like_args.append(pattern)
+
+    ors: list[str] = []
+    args: list[str] = []
+    if len(eq_vals) == 1:
+        ors.append(f"{name_col} = %s")
+        args.append(eq_vals[0])
+    elif eq_vals:
+        placeholders = ", ".join(["%s"] * len(eq_vals))
+        ors.append(f"{name_col} IN ({placeholders})")
+        args.extend(eq_vals)
+    ors.extend(like_frags)
+    args.extend(like_args)
+
+    fragment = ors[0] if len(ors) == 1 else "(" + " OR ".join(ors) + ")"
+    return fragment, args
+
+
 def _query_edc_window(
     conn,
     table_name: str,
@@ -258,9 +323,9 @@ def _query_edc_window(
     wildcard_mode: str,
     exclude_like: str | None,
 ) -> list[dict]:
-    pattern, op = _edc_like_pattern(edc_name, wildcard_mode)
-    where = [f"{name_col} {op} %s", f"{time_col} >= %s", f"{time_col} <= %s"]
-    args: list[Any] = [pattern, start_s, end_s]
+    name_frag, name_args = _edc_name_predicate(name_col, edc_name, wildcard_mode)
+    where = [name_frag, f"{time_col} >= %s", f"{time_col} <= %s"]
+    args: list[Any] = [*name_args, start_s, end_s]
     if exclude_like:
         where.append(f"{name_col} NOT LIKE %s")
         args.append(exclude_like)
@@ -317,6 +382,8 @@ def _infer_query_path(targets: List[Any]) -> str:
 
 
 def _classify_query_error(exc: Exception) -> str:
+    if isinstance(exc, c95.NfaBatchQueryError):
+        exc = exc.original_exception
     text = str(exc or "").lower()
     timeout_markers = ("timeout", "timed out", "read timeout", "lock wait timeout")
     return "QUERY_TIMEOUT" if any(m in text for m in timeout_markers) else "QUERY_FAILED"
@@ -401,6 +468,23 @@ def _nfa_has_any_raw_points(
         "query_path": query_path,
         "query_elapsed_ms": int((time.monotonic() - t0) * 1000),
     }
+
+
+def _nfa_has_any_raw_points_via_fresh_connection(
+    db_cfg: Dict[str, Any],
+    targets: List[Any],
+    start_time: str,
+    end_time: str,
+    sample_pairs: int = 8,
+) -> Dict[str, Any]:
+    conn = c95.connect_to_db(db_cfg)
+    try:
+        return _nfa_has_any_raw_points(conn, targets, start_time, end_time, sample_pairs=sample_pairs)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _compute_edc_and_export(
@@ -532,7 +616,9 @@ def _compute_edc_and_export(
             daily_step1 = _step1(daily_avg_raw)
             range_step1 = _step1(range_raw)
 
-            effective_pattern, match_op = _edc_like_pattern(edc_name, wildcard_mode)
+            matched_names = _parse_edc_names(edc_name)
+            name_fragment, _name_fragment_args = _edc_name_predicate(name_col, edc_name, wildcard_mode)
+            effective_pattern, match_op = _edc_like_pattern(matched_names[0], wildcard_mode)
             budget_summary = {
                 "year_month": ym,
                 "formula": f"raw*{mul:g}/{div:g}/base/base",
@@ -542,6 +628,8 @@ def _compute_edc_and_export(
                 "source_value_column": value_col,
                 "match_mode": wildcard_mode,
                 "match_operator": match_op,
+                "match_names": matched_names,
+                "match_predicate": name_fragment,
                 "effective_pattern": effective_pattern,
                 "exclude_like": exclude_like,
                 "raw_daily_95_avg": float(daily_avg_raw),
@@ -1150,6 +1238,36 @@ def compute_and_export(
                 "diagnostic_extras": dict(diag_context),
             }
 
+        def _nfa_query_failure(reason: str, *, filename_noext: str, counters: Dict[str, Any] | None, exc: Exception):
+            terminal_code = _classify_query_error(exc)
+            original_exc = exc.original_exception if isinstance(exc, c95.NfaBatchQueryError) else exc
+            extras = dict(diag_context)
+            extras["exception_type"] = type(original_exc).__name__
+            if "query_elapsed_ms" not in extras:
+                extras["query_elapsed_ms"] = None
+            if isinstance(exc, c95.NfaBatchQueryError):
+                extras["failure_stage"] = exc.stage
+                extras["failure_query_path"] = exc.query_path
+            return _make_terminal_query_failure_artifacts(
+                job_id,
+                filename_noext,
+                reason,
+                source_type="nfa",
+                source_instance=source_instance,
+                resolved_window=resolved_window,
+                key_params={
+                    "province": province,
+                    "cp": cp,
+                    "school": school,
+                    "direction": direction,
+                    "monthly_aggregate": monthly_aggregate,
+                    "aggregate_all": aggregate_all,
+                },
+                counters=counters,
+                terminal_code=terminal_code,
+                extras=extras,
+            )
+
         _progress(progress_cb, 8, "NFA: 已连接数据源，加载匹配对象")
         schools = c95.get_schools_by_province_and_cp(conn, province, cp, school)
         if not schools:
@@ -1177,7 +1295,20 @@ def compute_and_export(
         probe_batch = max(100, min(1000, int(batch_size)))
         if hasattr(c95, "filter_pairs_with_data"):
             t_prefilter = time.monotonic()
-            active_pairs = c95.filter_pairs_with_data(conn, schools, start_time, end_time, batch_size=probe_batch)
+            try:
+                active_pairs = c95.filter_pairs_with_data(conn, schools, start_time, end_time, batch_size=probe_batch)
+            except c95.NfaBatchQueryError as e:
+                diag_context["prefilter_elapsed_ms"] = int((time.monotonic() - t_prefilter) * 1000)
+                reason = (
+                    f"NFA 预筛选失败：{e.original_exception}。"
+                    f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                )
+                return _nfa_query_failure(
+                    reason,
+                    filename_noext=base_name,
+                    counters={"pairs_total": len(pairs_all)},
+                    exc=e,
+                )
             prefilter_elapsed_ms = int((time.monotonic() - t_prefilter) * 1000)
             logger.info(
                 "NFA prefilter done: query_path=%s elapsed_ms=%s pairs_total=%s pairs_active=%s",
@@ -1243,38 +1374,51 @@ def compute_and_export(
                 et = pd.to_datetime(rg['end'])
                 _progress(progress_cb, 12 + int(i * 68 / total_months), f"NFA: 按月聚合 {rg['label']} ({i}/{total_months})")
 
-                if aggregate_all:
-                    if settlement_mode == 'daily_95_avg':
-                        # 先算该月“每日95”，再按该月天数求平均
-                        rows_daily = c95.aggregate_all_and_compute(conn, schools, st, et, direction, True, unit_base=unit_base)
-                        df_daily = _to_dataframe(rows_daily)
-                        try:
-                            _days = max(1, int(df_daily.shape[0]))
-                        except Exception:
-                            _days = 1
-                        if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
-                            avg_val = float(df_daily['daily_95th_percentile_mbps'].sum()) / float(_days)
+                try:
+                    if aggregate_all:
+                        if settlement_mode == 'daily_95_avg':
+                            # 先算该月“每日95”，再按该月天数求平均
+                            rows_daily = c95.aggregate_all_and_compute(conn, schools, st, et, direction, True, unit_base=unit_base)
+                            df_daily = _to_dataframe(rows_daily)
+                            try:
+                                _days = max(1, int(df_daily.shape[0]))
+                            except Exception:
+                                _days = 1
+                            if not df_daily.empty and 'daily_95th_percentile_mbps' in df_daily.columns:
+                                avg_val = float(df_daily['daily_95th_percentile_mbps'].sum()) / float(_days)
+                            else:
+                                avg_val = 0.0
+                            month_rows = [{
+                                'school_id': '',
+                                'ipgroup_name': '全部院校汇总',
+                                'ipgroup_id': '',
+                                'nfa_uuid': '',
+                                'saler_group': '',
+                                'saler': '',
+                                '95th_percentile_mbps': avg_val,
+                                'direction': direction,
+                            }]
                         else:
-                            avg_val = 0.0
-                        month_rows = [{
-                            'school_id': '',
-                            'ipgroup_name': '全部院校汇总',
-                            'ipgroup_id': '',
-                            'nfa_uuid': '',
-                            'saler_group': '',
-                            'saler': '',
-                            '95th_percentile_mbps': avg_val,
-                            'direction': direction,
-                        }]
+                            # 该月范围内在时间点上汇总后计算 95
+                            month_rows = c95.aggregate_all_and_compute(conn, schools, st, et, direction, False, unit_base=unit_base)
                     else:
-                        # 该月范围内在时间点上汇总后计算 95
-                        month_rows = c95.aggregate_all_and_compute(conn, schools, st, et, direction, False, unit_base=unit_base)
-                else:
-                    month_rows = c95.process_schools_batched(
-                        conn, schools,
-                        st, et,
-                        direction, False,
-                        batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                        month_rows = c95.process_schools_batched(
+                            conn, schools,
+                            st, et,
+                            direction, False,
+                            batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                        )
+                except c95.NfaBatchQueryError as e:
+                    diag_context["query_elapsed_ms"] = int((time.monotonic() - t_monthly_agg) * 1000)
+                    reason = (
+                        f"NFA 按月聚合查询失败：{e.original_exception}。"
+                        f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                    )
+                    return _nfa_query_failure(
+                        reason,
+                        filename_noext=f"{base_name}-monthly",
+                        counters={"matched_schools": len(schools), "months": len(month_ranges)},
+                        exc=e,
                     )
 
                 if month_rows:
@@ -1308,12 +1452,12 @@ def compute_and_export(
             if dfm.empty:
                 try:
                     t_probe = time.monotonic()
-                    probe = _nfa_has_any_raw_points(conn, schools, start_time, end_time)
+                    probe = _nfa_has_any_raw_points_via_fresh_connection(db_cfg, schools, start_time, end_time)
                     probe_elapsed_ms = int((time.monotonic() - t_probe) * 1000)
                     diag_context["probe_status"] = "found_raw_points" if probe.get("has_points") else "no_raw_points"
                     diag_context["probe_elapsed_ms"] = probe_elapsed_ms
                     if probe.get("query_path"):
-                        diag_context["query_path"] = str(probe.get("query_path"))
+                        diag_context["probe_query_path"] = str(probe.get("query_path"))
                     logger.info(
                         "NFA empty probe done: has_points=%s query_path=%s elapsed_ms=%s",
                         bool(probe.get("has_points")),
@@ -1328,7 +1472,6 @@ def compute_and_export(
                 except ValueError:
                     raise
                 except Exception as e:
-                    terminal_code = _classify_query_error(e)
                     reason = (
                         f"NFA 空结果探测失败：{e}。"
                         f"可能是数据库查询超时或连接异常，窗口={window_label}"
@@ -1349,7 +1492,7 @@ def compute_and_export(
                             "aggregate_all": aggregate_all,
                         },
                         counters={"matched_schools": len(schools), "months": len(month_ranges)},
-                        terminal_code=terminal_code,
+                        terminal_code=_classify_query_error(e),
                         extras={
                             **diag_context,
                             "probe_status": "probe_failed",
@@ -1613,11 +1756,24 @@ def compute_and_export(
                 if settlement_mode == 'daily_95_avg':
                     # 先每日95，再根据 export_daily 决定是否求平均
                     t_rows = time.monotonic()
-                    rows_daily = c95.process_schools_batched(
-                        conn, schools,
-                        pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
-                    )
+                    try:
+                        rows_daily = c95.process_schools_batched(
+                            conn, schools,
+                            pd.to_datetime(start_time), pd.to_datetime(end_time),
+                            direction, True, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                        )
+                    except c95.NfaBatchQueryError as e:
+                        diag_context["query_elapsed_ms"] = int((time.monotonic() - t_rows) * 1000)
+                        reason = (
+                            f"NFA 批量查询失败：{e.original_exception}。"
+                            f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                        )
+                        return _nfa_query_failure(
+                            reason,
+                            filename_noext=base_name,
+                            counters={"matched_schools": len(schools), "pairs_total": len(pairs_all)},
+                            exc=e,
+                        )
                     query_elapsed_ms = int((time.monotonic() - t_rows) * 1000)
                     diag_context["query_elapsed_ms"] = query_elapsed_ms
                     logger.info(
@@ -1645,11 +1801,24 @@ def compute_and_export(
                             df = pd.DataFrame()
                 else:
                     t_rows = time.monotonic()
-                    rows = c95.process_schools_batched(
-                        conn, schools,
-                        pd.to_datetime(start_time), pd.to_datetime(end_time),
-                        direction, export_daily, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
-                    )
+                    try:
+                        rows = c95.process_schools_batched(
+                            conn, schools,
+                            pd.to_datetime(start_time), pd.to_datetime(end_time),
+                            direction, export_daily, batch_size=batch_size, unit_base=unit_base, combine_v4_v6=combine_v4_v6, merge_key=merge_key
+                        )
+                    except c95.NfaBatchQueryError as e:
+                        diag_context["query_elapsed_ms"] = int((time.monotonic() - t_rows) * 1000)
+                        reason = (
+                            f"NFA 批量查询失败：{e.original_exception}。"
+                            f"可能是数据库查询超时或连接异常，窗口={window_label}"
+                        )
+                        return _nfa_query_failure(
+                            reason,
+                            filename_noext=base_name,
+                            counters={"matched_schools": len(schools), "pairs_total": len(pairs_all)},
+                            exc=e,
+                        )
                     # 不再回退到原逐院校方法：避免无数据场景下逐校空查导致长时间运行
                     df = _to_dataframe(rows)
                     query_elapsed_ms = int((time.monotonic() - t_rows) * 1000)
@@ -1665,12 +1834,12 @@ def compute_and_export(
                 if df is None or df.empty:
                     try:
                         t_probe = time.monotonic()
-                        probe = _nfa_has_any_raw_points(conn, schools, start_time, end_time)
+                        probe = _nfa_has_any_raw_points_via_fresh_connection(db_cfg, schools, start_time, end_time)
                         probe_elapsed_ms = int((time.monotonic() - t_probe) * 1000)
                         diag_context["probe_status"] = "found_raw_points" if probe.get("has_points") else "no_raw_points"
                         diag_context["probe_elapsed_ms"] = probe_elapsed_ms
                         if probe.get("query_path"):
-                            diag_context["query_path"] = str(probe.get("query_path"))
+                            diag_context["probe_query_path"] = str(probe.get("query_path"))
                         logger.info(
                             "NFA empty probe done: has_points=%s query_path=%s elapsed_ms=%s",
                             bool(probe.get("has_points")),

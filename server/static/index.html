@@ -293,7 +293,11 @@
             <input v-model.trim="newTask.params.cp" placeholder="CP，如bilibili" />
           </template>
           <template v-else>
-            <input v-model.trim="newTask.params.edc_name" placeholder="EDC名称，如 BJ-jinshan-*" />
+            <input v-model.trim="newTask.params.edc_name" placeholder="EDC名称，前缀 BJ-jinshan-* / 多个精确名用逗号分隔" style="min-width:280px;" />
+            <select v-model="newTask.params.edc_match_mode" title="名称匹配方式">
+              <option value="prefix">前缀(prefix)</option>
+              <option value="exact">精确(exact/IN)</option>
+            </select>
             <label><input type="checkbox" v-model="newTask.params.data_budget_enabled" /> 数据预算</label>
             <input v-if="newTask.params.data_budget_enabled" v-model.number="newTask.params.data_budget_mul" type="number" step="0.0001" placeholder="乘数，如 8" />
             <input v-if="newTask.params.data_budget_enabled" v-model.number="newTask.params.data_budget_div" type="number" step="0.0001" placeholder="除数，如 300" />
@@ -407,7 +411,11 @@
           <input v-model.trim="editTask.params.cp" placeholder="CP，如bilibili" />
         </template>
         <template v-else>
-          <input v-model.trim="editTask.params.edc_name" placeholder="EDC名称，如 BJ-jinshan-*" />
+          <input v-model.trim="editTask.params.edc_name" placeholder="EDC名称，前缀 BJ-jinshan-* / 多个精确名用逗号分隔" style="min-width:280px;" />
+          <select v-model="editTask.params.edc_match_mode" title="名称匹配方式">
+            <option value="prefix">前缀(prefix)</option>
+            <option value="exact">精确(exact/IN)</option>
+          </select>
           <label><input type="checkbox" v-model="editTask.params.data_budget_enabled" /> 数据预算</label>
           <input v-if="editTask.params.data_budget_enabled" v-model.number="editTask.params.data_budget_mul" type="number" step="0.0001" placeholder="乘数，如 8" />
           <input v-if="editTask.params.data_budget_enabled" v-model.number="editTask.params.data_budget_div" type="number" step="0.0001" placeholder="除数，如 300" />

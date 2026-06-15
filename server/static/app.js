@@ -88,7 +88,7 @@ createApp({
         timezone: 'Asia/Shanghai',
         window_selector: 'custom',
         window_params: {},
-        params: { direction: 'both', export_daily: false, sortby: '', sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, merge_key: '', batch_size: 200, school: '', exclude_school: '', unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300, edc_name: '' },
+        params: { direction: 'both', export_daily: false, sortby: '', sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, merge_key: '', batch_size: 200, school: '', exclude_school: '', unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300, edc_name: '', edc_match_mode: 'prefix' },
         export_formats: ['csv'],
         output_filename_template: ''
       },
@@ -603,7 +603,8 @@ createApp({
         data_budget_enabled: false,
         data_budget_mul: 8,
         data_budget_div: 300,
-        edc_name: ''
+        edc_name: '',
+        edc_match_mode: 'prefix'
       }
     },
     normalizeSourceParams(obj) {
@@ -633,6 +634,7 @@ createApp({
         delete p.cp
         if (p.data_budget_mul == null || p.data_budget_mul === '') p.data_budget_mul = 8
         if (p.data_budget_div == null || p.data_budget_div === '') p.data_budget_div = 300
+        if (p.edc_match_mode !== 'exact' && p.edc_match_mode !== 'prefix') p.edc_match_mode = 'prefix'
       } else {
         if (!p.direction) p.direction = 'both'
         if (typeof p.aggregate_all !== 'boolean') p.aggregate_all = false
@@ -642,6 +644,7 @@ createApp({
         if (!p.combine_v4_v6) p.merge_key = ''
         if (!p.batch_size || Number(p.batch_size) < 10) p.batch_size = 200
         delete p.edc_name
+        delete p.edc_match_mode
         delete p.data_budget_enabled
         delete p.data_budget_mul
         delete p.data_budget_div
@@ -762,6 +765,7 @@ createApp({
       const d = this.bulkDefaults
       const params = {
         edc_name: String(item.edc_name || '').trim(),
+        edc_match_mode: d.edc_match_mode === 'exact' ? 'exact' : 'prefix',
         direction: 'both',
         export_daily: false,
         sort_order: 'desc',

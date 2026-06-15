@@ -44,7 +44,9 @@ uvicorn server.main:app --reload --port 8000
 ### 多数据源配置建议
 
 - NFA 任务参数示例：`params.province`、`params.cp`、`params.direction`
-- EDC 任务参数示例：`params.edc_name`（支持 `*` 通配），结算可配 `params.settlement_mode`（`range_95` / `daily_95_avg`）
+- EDC 任务参数示例：`params.edc_name`（名称匹配，支持 `*`/`?` 通配），结算可配 `params.settlement_mode`（`range_95` / `daily_95_avg`）
+  - 名称匹配方式由 `params.edc_match_mode` 控制（覆盖实例的 `wildcard_mode`）：`prefix`（默认，`x` → `LIKE 'x%'`）或 `exact`（精确等值）
+  - `edc_name` 支持用逗号/换行分隔多个名称：多个精确名会合并为 `name_col IN (...)`，可精确包含指定节点而不误匹配相邻前缀（如包含 `SD-cs-bj-3495,SD-cs-bj-3496` 但不命中 `SD-cs-bj-3497`）；上限 `EDC_MAX_NAMES`（500）
 - 在 `.env` 中使用 `NFA_INSTANCES_JSON` / `EDC_INSTANCES_JSON` 配置多实例；若未配置 NFA 实例，仍兼容原 `MYSQL_*` 单实例配置
 
 ## 打包为单文件可执行（Windows）
