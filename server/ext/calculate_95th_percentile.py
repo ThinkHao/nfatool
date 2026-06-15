@@ -24,6 +24,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("95值计算工具")
 
+
+class NfaBatchQueryError(RuntimeError):
+    """Structured failure for NFA batched queries."""
+
+    def __init__(self, stage: str, query_path: str, original_exception: Exception):
+        self.stage = str(stage or "unknown")
+        self.query_path = str(query_path or "unknown")
+        self.original_exception = original_exception
+        super().__init__(
+            f"NFA batched query failed at stage={self.stage}, "
+            f"query_path={self.query_path}: {original_exception}"
+        )
+
+
+def _resolve_query_path(used_hash_query: bool, used_pair_query: bool) -> str:
+    if used_hash_query and used_pair_query:
+        return "hash_uuid+pair_fallback"
+    if used_hash_query:
+        return "hash_uuid"
+    if used_pair_query:
+        return "pair_fallback"
+    return "none"
+
+
+def _raise_batch_query_error(stage: str, used_hash_query: bool, used_pair_query: bool, exc: Exception):
+    raise NfaBatchQueryError(stage, _resolve_query_path(used_hash_query, used_pair_query), exc)
+
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='计算指定省份、指定CP类型、指定时间范围内所有院校的95值')
@@ -305,6 +332,7 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
                 used_hash_query = True
             except Exception as e:
                 logger.error(f"批量拉取速度数据失败(hash_uuid): {e}")
+                _raise_batch_query_error("raw_fetch", True, used_pair_query, e)
         if without_hash:
             placeholders = ", ".join(["(%s, %s)"] * len(without_hash))
             sql = f"""
@@ -327,8 +355,9 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
                 used_pair_query = True
             except Exception as e:
                 logger.error(f"批量拉取速度数据失败(pair_fallback): {e}")
+                _raise_batch_query_error("raw_fetch", used_hash_query, True, e)
     if used_hash_query or used_pair_query:
-        path = "hash_uuid" if (used_hash_query and not used_pair_query) else ("pair_fallback" if (used_pair_query and not used_hash_query) else "hash_uuid+pair_fallback")
+        path = _resolve_query_path(used_hash_query, used_pair_query)
         logger.info(f"批量拉取查询路径: {path}")
     if not frames:
         return pd.DataFrame()
@@ -339,7 +368,7 @@ def fetch_speed_data_for_pairs_raw(connection, pairs, start_time, end_time, batc
 
 def filter_pairs_with_data(connection, pairs, start_time, end_time, batch_size=300):
     """返回在时间窗口内至少有一条流量数据的 (ipgroup_id, nfa_uuid) 集合。
-    查询失败时返回 None（调用方可回退到原路径）。
+    查询失败时抛出结构化异常，调用方决定如何处理。
     """
     targets = _normalize_query_targets(pairs)
     if not targets:
@@ -370,7 +399,7 @@ def filter_pairs_with_data(connection, pairs, start_time, end_time, batch_size=3
                 used_hash_query = True
             except Exception as e:
                 logger.error(f"预筛选有数据对象失败(hash_uuid): {e}")
-                return None
+                _raise_batch_query_error("prefilter", True, used_pair_query, e)
         if without_hash:
             placeholders = ", ".join(["(%s, %s)"] * len(without_hash))
             sql = f"""
@@ -391,9 +420,9 @@ def filter_pairs_with_data(connection, pairs, start_time, end_time, batch_size=3
                 used_pair_query = True
             except Exception as e:
                 logger.error(f"预筛选有数据对象失败(pair_fallback): {e}")
-                return None
+                _raise_batch_query_error("prefilter", used_hash_query, True, e)
     if used_hash_query or used_pair_query:
-        path = "hash_uuid" if (used_hash_query and not used_pair_query) else ("pair_fallback" if (used_pair_query and not used_hash_query) else "hash_uuid+pair_fallback")
+        path = _resolve_query_path(used_hash_query, used_pair_query)
         logger.info(f"预筛选查询路径: {path}")
     return matched
 
@@ -687,68 +716,72 @@ def aggregate_speed_data_for_pairs_db(connection, pairs, start_time, end_time):
     frames = []
     used_hash_query = False
     used_pair_query = False
-    try:
-        if with_hash:
-            placeholders = ", ".join(["%s"] * len(with_hash))
-            sql = f"""
-                SELECT create_time,
-                       SUM(recv) AS recv,
-                       SUM(send) AS send
-                FROM nfa_ip_group_speed_logs_5m
-                WHERE create_time BETWEEN %s AND %s
-                  AND hash_uuid IN ({placeholders})
-                GROUP BY create_time
-                ORDER BY create_time
-            """
-            params = [start_time, end_time] + [x['hash_uuid'] for x in with_hash]
+    if with_hash:
+        placeholders = ", ".join(["%s"] * len(with_hash))
+        sql = f"""
+            SELECT create_time,
+                   SUM(recv) AS recv,
+                   SUM(send) AS send
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND hash_uuid IN ({placeholders})
+            GROUP BY create_time
+            ORDER BY create_time
+        """
+        params = [start_time, end_time] + [x['hash_uuid'] for x in with_hash]
+        try:
             with connection.cursor() as cursor:
                 cursor.execute(sql, tuple(params))
                 rows = cursor.fetchall()
                 if rows:
                     frames.append(pd.DataFrame(rows))
             used_hash_query = True
+        except Exception as e:
+            logger.error(f"数据库端聚合失败(hash_uuid): {e}")
+            _raise_batch_query_error("aggregate_db", True, used_pair_query, e)
 
-        if without_hash:
-            placeholders = ", ".join(["(%s, %s)"] * len(without_hash))
-            sql = f"""
-                SELECT create_time,
-                       SUM(recv) AS recv,
-                       SUM(send) AS send
-                FROM nfa_ip_group_speed_logs_5m
-                WHERE create_time BETWEEN %s AND %s
-                  AND (ipgroup_id, nfa_uuid) IN ({placeholders})
-                GROUP BY create_time
-                ORDER BY create_time
-            """
-            params = [start_time, end_time]
-            for x in without_hash:
-                params.extend([x['ipgroup_id'], x['nfa_uuid']])
+    if without_hash:
+        placeholders = ", ".join(["(%s, %s)"] * len(without_hash))
+        sql = f"""
+            SELECT create_time,
+                   SUM(recv) AS recv,
+                   SUM(send) AS send
+            FROM nfa_ip_group_speed_logs_5m
+            WHERE create_time BETWEEN %s AND %s
+              AND (ipgroup_id, nfa_uuid) IN ({placeholders})
+            GROUP BY create_time
+            ORDER BY create_time
+        """
+        params = [start_time, end_time]
+        for x in without_hash:
+            params.extend([x['ipgroup_id'], x['nfa_uuid']])
+        try:
             with connection.cursor() as cursor:
                 cursor.execute(sql, tuple(params))
                 rows = cursor.fetchall()
                 if rows:
                     frames.append(pd.DataFrame(rows))
             used_pair_query = True
+        except Exception as e:
+            logger.error(f"数据库端聚合失败(pair_fallback): {e}")
+            _raise_batch_query_error("aggregate_db", used_hash_query, True, e)
 
-        if used_hash_query or used_pair_query:
-            path = "hash_uuid" if (used_hash_query and not used_pair_query) else ("pair_fallback" if (used_pair_query and not used_hash_query) else "hash_uuid+pair_fallback")
-            logger.info(f"数据库端聚合查询路径: {path}")
+    if used_hash_query or used_pair_query:
+        path = _resolve_query_path(used_hash_query, used_pair_query)
+        logger.info(f"数据库端聚合查询路径: {path}")
 
-        if not frames:
-            return pd.DataFrame()
-        if len(frames) == 1:
-            df = frames[0]
-        else:
-            df = pd.concat(frames, ignore_index=True).groupby('create_time', as_index=False)[['recv', 'send']].sum().sort_values('create_time')
-        df['create_time'] = pd.to_datetime(df['create_time'])
-        # 确保数值列为 float
-        for col in ('recv', 'send'):
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        return df
-    except Exception as e:
-        logger.error(f"数据库端聚合剩余院校失败: {e}")
+    if not frames:
         return pd.DataFrame()
+    if len(frames) == 1:
+        df = frames[0]
+    else:
+        df = pd.concat(frames, ignore_index=True).groupby('create_time', as_index=False)[['recv', 'send']].sum().sort_values('create_time')
+    df['create_time'] = pd.to_datetime(df['create_time'])
+    # 确保数值列为 float
+    for col in ('recv', 'send'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df
 
 def aggregate_all_and_compute(connection, schools, start_time, end_time, direction, export_daily, unit_base: int = 1024):
     """

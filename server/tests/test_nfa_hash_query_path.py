@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 import sys
 import types
+import pytest
 
 if "pymysql" not in sys.modules:
     pymysql_stub = types.SimpleNamespace()
@@ -159,3 +160,58 @@ def test_aggregate_speed_data_for_pairs_db_mixed_paths_are_merged():
     assert float(row0["send"]) == 15.0
     assert any("hash_uuid IN" in s for s in conn.sqls)
     assert any("(ipgroup_id, nfa_uuid) IN" in s for s in conn.sqls)
+
+
+def test_fetch_speed_data_for_pairs_raw_raises_batch_query_error():
+    class _BrokenCursor(_FakeCursor):
+        def execute(self, sql, params=()):
+            s = " ".join(str(sql).split())
+            self.conn.sqls.append(s)
+            raise TimeoutError("query timeout")
+
+    class _BrokenConn(_FakeConn):
+        def cursor(self):
+            return _BrokenCursor(self)
+
+    conn = _BrokenConn()
+
+    with pytest.raises(c95.NfaBatchQueryError) as exc_info:
+        c95.fetch_speed_data_for_pairs_raw(
+            conn,
+            [{"ipgroup_id": 1, "nfa_uuid": "u1", "hash_uuid": "h1"}],
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:10:00",
+            batch_size=200,
+        )
+
+    exc = exc_info.value
+    assert exc.stage == "raw_fetch"
+    assert exc.query_path == "hash_uuid"
+    assert isinstance(exc.original_exception, TimeoutError)
+
+
+def test_aggregate_speed_data_for_pairs_db_raises_batch_query_error():
+    class _BrokenCursor(_FakeCursor):
+        def execute(self, sql, params=()):
+            s = " ".join(str(sql).split())
+            self.conn.sqls.append(s)
+            raise RuntimeError("interface gone")
+
+    class _BrokenConn(_FakeConn):
+        def cursor(self):
+            return _BrokenCursor(self)
+
+    conn = _BrokenConn()
+
+    with pytest.raises(c95.NfaBatchQueryError) as exc_info:
+        c95.aggregate_speed_data_for_pairs_db(
+            conn,
+            [{"ipgroup_id": 1, "nfa_uuid": "u1", "hash_uuid": "h1"}],
+            "2026-01-01 00:00:00",
+            "2026-01-01 00:10:00",
+        )
+
+    exc = exc_info.value
+    assert exc.stage == "aggregate_db"
+    assert exc.query_path == "hash_uuid"
+    assert isinstance(exc.original_exception, RuntimeError)

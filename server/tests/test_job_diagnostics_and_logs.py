@@ -410,6 +410,108 @@ def test_monthly_probe_failure_returns_query_timeout(monkeypatch, tmp_path):
     assert payload["query_path"] == "hash_uuid"
 
 
+def test_monthly_query_failure_skips_probe_and_preserves_root_cause(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    probe_called = {"value": False}
+
+    monkeypatch.setattr(compute95.c95, "connect_to_db", lambda cfg: _FakeNfaConn())
+    monkeypatch.setattr(
+        compute95.c95,
+        "get_schools_by_province_and_cp",
+        lambda conn, province, cp, school: [
+            {"ipgroup_id": 2500196, "nfa_uuid": "u1", "hash_uuid": "h1", "school_name": "长清大学城"}
+        ],
+    )
+    monkeypatch.setattr(compute95.c95, "filter_pairs_with_data", lambda *args, **kwargs: {(2500196, "u1")})
+    monkeypatch.setattr(
+        compute95.c95,
+        "process_schools_batched",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            compute95.c95.NfaBatchQueryError("monthly_compute", "hash_uuid", TimeoutError("query timeout"))
+        ),
+    )
+
+    def _probe_should_not_run(*args, **kwargs):
+        probe_called["value"] = True
+        raise AssertionError("probe should not run after batch query failure")
+
+    monkeypatch.setattr(compute95, "_nfa_has_any_raw_points", _probe_should_not_run)
+
+    artifacts = compute95.compute_and_export(
+        "job-monthly-query-failed",
+        _window(),
+        _nfa_params(monthly_aggregate=True),
+        ["csv"],
+        None,
+    )
+
+    assert probe_called["value"] is False
+    marker = next(x for x in artifacts if x.get("terminal_code"))
+    assert marker["terminal_code"] == "QUERY_TIMEOUT"
+    diag = next(x for x in artifacts if x["filename"].endswith("-diagnostics.json"))
+    payload = json.loads(Path(diag["path"]).read_text(encoding="utf-8"))
+    assert payload["terminal_code"] == "QUERY_TIMEOUT"
+    assert payload["failure_stage"] == "monthly_compute"
+    assert payload["failure_query_path"] == "hash_uuid"
+    assert payload["exception_type"] == "TimeoutError"
+    assert "probe_status" not in payload
+
+
+def test_period_query_failure_skips_probe_and_preserves_root_cause(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    probe_called = {"value": False}
+
+    monkeypatch.setattr(compute95.c95, "connect_to_db", lambda cfg: _FakeNfaConn())
+    monkeypatch.setattr(
+        compute95.c95,
+        "get_schools_by_province_and_cp",
+        lambda conn, province, cp, school: [
+            {"ipgroup_id": 2500196, "nfa_uuid": "u1", "hash_uuid": "h1", "school_name": "长清大学城"}
+        ],
+    )
+    monkeypatch.setattr(compute95.c95, "filter_pairs_with_data", lambda *args, **kwargs: {(2500196, "u1")})
+    monkeypatch.setattr(
+        compute95.c95,
+        "process_schools_batched",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            compute95.c95.NfaBatchQueryError("raw_fetch", "hash_uuid", RuntimeError("interface gone"))
+        ),
+    )
+
+    def _probe_should_not_run(*args, **kwargs):
+        probe_called["value"] = True
+        raise AssertionError("probe should not run after batch query failure")
+
+    monkeypatch.setattr(compute95, "_nfa_has_any_raw_points", _probe_should_not_run)
+
+    artifacts = compute95.compute_and_export(
+        "job-period-query-failed",
+        _window(),
+        _nfa_params(monthly_aggregate=False),
+        ["csv"],
+        None,
+    )
+
+    assert probe_called["value"] is False
+    marker = next(x for x in artifacts if x.get("terminal_code"))
+    assert marker["terminal_code"] == "QUERY_FAILED"
+    diag = next(x for x in artifacts if x["filename"].endswith("-diagnostics.json"))
+    payload = json.loads(Path(diag["path"]).read_text(encoding="utf-8"))
+    assert payload["terminal_code"] == "QUERY_FAILED"
+    assert payload["failure_stage"] == "raw_fetch"
+    assert payload["failure_query_path"] == "hash_uuid"
+    assert payload["exception_type"] == "RuntimeError"
+    assert "probe_status" not in payload
+
+
 def test_monthly_true_empty_keeps_empty_result(monkeypatch, tmp_path):
     import server.config as config
 
