@@ -567,16 +567,17 @@ async def list_jobs_page(
                 base = base.filter(and_(ts_col >= m, ts_col < m2))
             except Exception:
                 pass
+        data_month_bounds: tuple[datetime, datetime] | None = None
         if data_month:
             try:
                 dm = datetime.strptime(data_month, "%Y-%m")
                 dm2 = datetime(dm.year + 1, 1, 1) if dm.month == 12 else datetime(dm.year, dm.month + 1, 1)
-                start_expr = func.json_extract(JobRun.resolved_window, "$.start_time")
-                end_expr = func.json_extract(JobRun.resolved_window, "$.end_time")
-                base = base.filter(and_(start_expr < dm2.strftime("%Y-%m-%d %H:%M:%S"), end_expr >= dm.strftime("%Y-%m-%d %H:%M:%S")))
+                # Do not depend on SQLite JSON1: production's bundled SQLite may
+                # omit that extension. Existing runs already carry this JSON, so
+                # filter it after the normal SQL query and paginate in Python.
+                data_month_bounds = (dm, dm2)
             except Exception:
-                pass
-        total = base.count()
+                data_month_bounds = None
         # sorting
         sort_field = (sort_by or "started_at").lower()
         order = (sort_order or "desc").lower()
@@ -593,10 +594,30 @@ async def list_jobs_page(
         else:
             order_clause = primary.desc()
         # keep IS NULL ordering first for started_at to be consistent
-        if sort_field == "started_at":
-            rows = base.order_by((JobRun.started_at.is_(None)).asc(), order_clause).offset((page - 1) * page_size).limit(page_size).all()
+        if data_month_bounds:
+            if sort_field == "started_at":
+                candidates = base.order_by((JobRun.started_at.is_(None)).asc(), order_clause).all()
+            else:
+                candidates = base.order_by(order_clause).all()
+            dm_start, dm_end = data_month_bounds
+            filtered = []
+            for candidate in candidates:
+                try:
+                    window_value = json.loads(candidate.resolved_window or "{}")
+                    window_start = datetime.fromisoformat(str(window_value.get("start_time") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+                    window_end = datetime.fromisoformat(str(window_value.get("end_time") or "").replace("Z", "+00:00")).replace(tzinfo=None)
+                    if window_start < dm_end and window_end >= dm_start:
+                        filtered.append(candidate)
+                except Exception:
+                    continue
+            total = len(filtered)
+            rows = filtered[(page - 1) * page_size: page * page_size]
         else:
-            rows = base.order_by(order_clause).offset((page - 1) * page_size).limit(page_size).all()
+            total = base.count()
+            if sort_field == "started_at":
+                rows = base.order_by((JobRun.started_at.is_(None)).asc(), order_clause).offset((page - 1) * page_size).limit(page_size).all()
+            else:
+                rows = base.order_by(order_clause).offset((page - 1) * page_size).limit(page_size).all()
         task_ids = [r.task_id for r in rows if r.task_id is not None]
         task_kind_map: dict[int, str] = {}
         if task_ids:
