@@ -100,6 +100,42 @@ def _migrate_sqlite():
                 conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_task_groups_name ON task_groups (name)")
                 conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_data_source_configs_st_inst ON data_source_configs (source_type, instance)")
                 conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_data_source_audit_created_at ON data_source_config_audit (created_at)")
+                conn.exec_driver_sql("""
+                    CREATE TABLE IF NOT EXISTS edc_match_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_run_id VARCHAR(36) NOT NULL UNIQUE,
+                        task_id INTEGER,
+                        task_name_snapshot VARCHAR(200),
+                        data_source_instance VARCHAR(100) NOT NULL,
+                        window_start VARCHAR(32) NOT NULL,
+                        window_end VARCHAR(32) NOT NULL,
+                        edc_name_expression TEXT NOT NULL,
+                        match_mode VARCHAR(20) NOT NULL DEFAULT 'prefix',
+                        exclude_like VARCHAR(255),
+                        matched_count INTEGER NOT NULL DEFAULT 0,
+                        match_hash VARCHAR(64),
+                        status VARCHAR(20) NOT NULL DEFAULT 'resolved',
+                        error_message TEXT,
+                        source_config_fingerprint VARCHAR(64),
+                        resolved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY(job_run_id) REFERENCES job_runs(id)
+                    )
+                """)
+                conn.exec_driver_sql("""
+                    CREATE TABLE IF NOT EXISTS edc_match_snapshot_items (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        snapshot_id INTEGER NOT NULL,
+                        edc_name VARCHAR(255) NOT NULL,
+                        matched_by VARCHAR(255),
+                        match_operator VARCHAR(10),
+                        effective_pattern VARCHAR(255),
+                        FOREIGN KEY(snapshot_id) REFERENCES edc_match_snapshots(id) ON DELETE CASCADE,
+                        UNIQUE(snapshot_id, edc_name)
+                    )
+                """)
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edc_snapshot_window ON edc_match_snapshots (window_start, window_end)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edc_snapshot_instance ON edc_match_snapshots (data_source_instance)")
+                conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_edc_snapshot_items_name ON edc_match_snapshot_items (edc_name)")
                 # Backfill task_groups from historical task.group_name values.
                 conn.exec_driver_sql("""
                     INSERT OR IGNORE INTO task_groups (name, created_at, updated_at)

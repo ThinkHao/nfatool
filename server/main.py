@@ -32,12 +32,13 @@ from .config import (
     auto_rotate_data_source_key,
 )
 from .db import init_db, session_scope
-from .models import Task, JobRun, TaskGroup
+from .models import Task, JobRun, TaskGroup, EdcMatchSnapshot
 from .schemas import (
     TaskCreate, TaskUpdate, TaskOut, JobRunCreate, JobRunOut, TaskPageOut, JobRunPageOut,
     TaskBatchDelete, JobBatchDelete, JobBatchDownload,
     TaskGroupCreate, TaskGroupRename, TaskGroupAssign,
     DataSourceInstancePayload, DataSourceTestPayload, DataSourceRotateKeyPayload, DataSourceRotatePolicyPayload, UpdateApplyPayload,
+    EdcMatchPreviewPayload,
 )
 from .security import api_key_auth
 from .services.scheduler import (
@@ -52,6 +53,7 @@ from .services import scheduler as scheduler_service
 from .services.storage import get_job_dir
 from .services.logger import get_job_log_path
 from .services.compute95 import _connect_edc_db
+from .services.edc_matching import resolve_edc_match, source_config, snapshot_to_dict
 from .services.updater import check_update, apply_update, get_update_status
 
 app = FastAPI(title="NFA 95th Web Service", version="0.1.0")
@@ -534,6 +536,7 @@ async def list_jobs_page(
     page_size: int = Query(default=20, ge=1, le=200),
     status: Optional[str] = Query(default=None),
     month: Optional[str] = Query(default=None),  # YYYY-MM
+    data_month: Optional[str] = Query(default=None),  # YYYY-MM; month of the data window
     task_kind: Optional[str] = Query(default="all"),  # all|periodic|one_off
     sort_by: Optional[str] = Query(default="started_at"),
     sort_order: Optional[str] = Query(default="desc")
@@ -562,6 +565,15 @@ async def list_jobs_page(
                     m2 = datetime(m.year, m.month + 1, 1)
                 ts_col = func.coalesce(JobRun.finished_at, JobRun.started_at)
                 base = base.filter(and_(ts_col >= m, ts_col < m2))
+            except Exception:
+                pass
+        if data_month:
+            try:
+                dm = datetime.strptime(data_month, "%Y-%m")
+                dm2 = datetime(dm.year + 1, 1, 1) if dm.month == 12 else datetime(dm.year, dm.month + 1, 1)
+                start_expr = func.json_extract(JobRun.resolved_window, "$.start_time")
+                end_expr = func.json_extract(JobRun.resolved_window, "$.end_time")
+                base = base.filter(and_(start_expr < dm2.strftime("%Y-%m-%d %H:%M:%S"), end_expr >= dm.strftime("%Y-%m-%d %H:%M:%S")))
             except Exception:
                 pass
         total = base.count()
@@ -612,6 +624,7 @@ async def list_jobs_page(
                 artifacts=artifacts,
                 log_path=r.log_path,
                 error_message=r.error_message,
+                edc_match=snapshot_to_dict(s.query(EdcMatchSnapshot).filter(EdcMatchSnapshot.job_run_id == r.id).first()),
             ))
         return JobRunPageOut(items=items, total=total, page=page, page_size=page_size)
 
@@ -789,6 +802,8 @@ async def delete_task(task_id: int):
         t = s.get(Task, task_id)
         if not t:
             raise HTTPException(status_code=404, detail="Task not found")
+        # Keep historical runs and their EDC snapshots queryable after task deletion.
+        s.query(JobRun).filter(JobRun.task_id == task_id).update({"task_id": None}, synchronize_session=False)
         s.delete(t)
     # Remove scheduled job if exists
     try:
@@ -808,6 +823,7 @@ async def batch_delete_tasks(payload: TaskBatchDelete):
     with session_scope() as s:
         rows = s.query(Task).filter(Task.id.in_(ids)).all()
         for t in rows:
+            s.query(JobRun).filter(JobRun.task_id == t.id).update({"task_id": None}, synchronize_session=False)
             s.delete(t)
             deleted += 1
     try:
@@ -836,6 +852,44 @@ async def run_ad_hoc(payload: JobRunCreate):
     settings = get_settings()
     job_id = create_ad_hoc_job_run(payload.model_dump(exclude_unset=True), settings.TIMEZONE)
     return {"job_id": job_id}
+
+
+@app.post("/api/edc/matches/preview", dependencies=[Depends(api_key_auth)])
+async def preview_edc_match(payload: EdcMatchPreviewPayload):
+    params = {"data_source_instance": payload.data_source_instance, "edc_name": payload.edc_name}
+    cfg = source_config(payload.data_source_instance, params)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"EDC data source instance not found: {payload.data_source_instance}")
+    conn = tunnel = None
+    try:
+        conn, tunnel = _connect_edc_db(cfg)
+        items = resolve_edc_match(conn, cfg, payload.edc_name, payload.edc_match_mode or "prefix",
+                                   payload.start_time, payload.end_time, payload.edc_exclude_like)
+        names = [x["edc_name"] for x in items]
+        return {
+            "status": "resolved" if names else "empty",
+            "data_source_instance": payload.data_source_instance,
+            "window_start": payload.start_time,
+            "window_end": payload.end_time,
+            "edc_name_expression": payload.edc_name,
+            "match_mode": payload.edc_match_mode or "prefix",
+            "exclude_like": payload.edc_exclude_like,
+            "matched_count": len(names),
+            "items": items,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+        try:
+            if tunnel is not None:
+                tunnel.stop()
+        except Exception:
+            pass
 
 
 @app.get("/api/jobs", response_model=list[JobRunOut], dependencies=[Depends(api_key_auth)])
@@ -873,6 +927,7 @@ async def list_jobs(task_id: Optional[int] = Query(default=None)):
                 artifacts=artifacts,
                 log_path=r.log_path,
                 error_message=r.error_message,
+                edc_match=snapshot_to_dict(s.query(EdcMatchSnapshot).filter(EdcMatchSnapshot.job_run_id == r.id).first()),
             )
             out.append(row)
     return out
@@ -908,7 +963,17 @@ async def get_job(job_id: str):
             artifacts=artifacts,
             log_path=r.log_path,
             error_message=r.error_message,
+            edc_match=snapshot_to_dict(s.query(EdcMatchSnapshot).filter(EdcMatchSnapshot.job_run_id == r.id).first()),
         )
+
+
+@app.get("/api/jobs/{job_id}/edc-match", dependencies=[Depends(api_key_auth)])
+async def get_job_edc_match(job_id: str):
+    with session_scope() as s:
+        row = s.query(EdcMatchSnapshot).filter(EdcMatchSnapshot.job_run_id == job_id).first()
+        if not row:
+            raise HTTPException(status_code=404, detail="EDC 匹配快照不存在")
+        return snapshot_to_dict(row)
 
 
 @app.get("/api/jobs/{job_id}/download", dependencies=[Depends(api_key_auth)])

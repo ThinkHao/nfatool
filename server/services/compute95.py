@@ -20,6 +20,7 @@ from ..config import get_data_source_instances
 from .exporter import export_csv, export_xlsx
 from .storage import get_job_dir, safe_artifact_path
 from .unit_conversion import mbps_to_raw, raw_to_mbps
+from .edc_matching import resolve_edc_match, save_snapshot, get_snapshot_names
 
 logger = logging.getLogger(__name__)
 
@@ -537,6 +538,31 @@ def _compute_edc_and_export(
     conn, tunnel = _connect_edc_db(cfg)
     try:
         _progress(progress_cb, 8, "EDC: 已连接数据源，开始按天计算")
+        # Resolve once per run and freeze the actual object set. Retries reuse the
+        # persisted snapshot, so a changing prefix cannot alter the calculation.
+        frozen_names = get_snapshot_names(job_id)
+        if frozen_names is None:
+            resolved_items = resolve_edc_match(
+                conn, cfg, edc_name, wildcard_mode,
+                f"{start_time}", f"{end_time}", exclude_like,
+            )
+            save_snapshot(
+                job_id, resolved_window, params, resolved_items, cfg,
+                task_id=params.get("_task_id"), task_name=params.get("_task_name_snapshot"),
+            )
+            frozen_names = [str(x.get("edc_name")) for x in resolved_items]
+        effective_edc_name = ",".join(frozen_names)
+        effective_match_mode = "exact"
+        _progress(progress_cb, 9, f"EDC: 已冻结匹配对象 {len(frozen_names)} 个")
+        if not frozen_names:
+            reason = f"EDC 无匹配对象：模式={edc_name}，时间范围={start_time}~{end_time}"
+            _progress(progress_cb, 92, "EDC: 无匹配对象，正在结束任务")
+            return _make_terminal_no_data_artifacts(
+                job_id, base_name, reason, source_type="edc", source_instance=source_instance,
+                resolved_window=resolved_window,
+                key_params={"edc_name": edc_name, "wildcard_mode": wildcard_mode, "exclude_like": exclude_like},
+                counters={"matched_objects": 0},
+            )
         st = pd.to_datetime(start_time)
         et = pd.to_datetime(end_time)
         daily_rows: List[Dict[str, Any]] = []
@@ -545,9 +571,9 @@ def _compute_edc_and_export(
             day_start = max(st, cur)
             day_end = min(et, cur + timedelta(days=1) - timedelta(seconds=1))
             rows = _query_edc_window(
-                conn, table_name, time_col, name_col, value_col, edc_name,
+                conn, table_name, time_col, name_col, value_col, effective_edc_name,
                 f"{day_start:%Y-%m-%d %H:%M:%S}", f"{day_end:%Y-%m-%d %H:%M:%S}",
-                wildcard_mode, exclude_like,
+                effective_match_mode, exclude_like,
             )
             raw95, points = _pick_daily_95_from_rows(rows, rank_index)
             daily_rows.append({
@@ -569,9 +595,9 @@ def _compute_edc_and_export(
         if daily_rows:
             daily_avg_raw = float(pd.Series([float(r.get("daily_95th_percentile_raw") or 0.0) for r in daily_rows]).sum()) / float(total_days)
         full_rows = _query_edc_window(
-            conn, table_name, time_col, name_col, value_col, edc_name,
+            conn, table_name, time_col, name_col, value_col, effective_edc_name,
             f"{st:%Y-%m-%d %H:%M:%S}", f"{et:%Y-%m-%d %H:%M:%S}",
-            wildcard_mode, exclude_like,
+            effective_match_mode, exclude_like,
         )
         if not full_rows:
             reason = f"EDC 无匹配数据：模式={edc_name}，时间范围={st:%Y-%m-%d}~{et:%Y-%m-%d}"
@@ -686,8 +712,8 @@ def _compute_edc_and_export(
                     points = len(month_daily)
                 else:
                     month_full_rows = _query_edc_window(
-                        conn, table_name, time_col, name_col, value_col, edc_name,
-                        rg["start"], rg["end"], wildcard_mode, exclude_like
+                        conn, table_name, time_col, name_col, value_col, effective_edc_name,
+                        rg["start"], rg["end"], effective_match_mode, exclude_like
                     )
                     month_raw, points = _pick_daily_95_from_rows(month_full_rows, rank_index)
                     month_mbps = raw_to_mbps(float(month_raw), unit_base, edc_divisor)

@@ -99,6 +99,7 @@ class JobRunOut(BaseModel):
     artifacts: list[dict[str, Any]] = Field(default_factory=list)
     log_path: Optional[str] = None
     error_message: Optional[str] = None
+    edc_match: Optional[dict[str, Any]] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -115,6 +116,15 @@ class JobRunPageOut(BaseModel):
     total: int
     page: int
     page_size: int
+
+
+class EdcMatchPreviewPayload(BaseModel):
+    data_source_instance: str = "default"
+    start_time: str
+    end_time: str
+    edc_name: str
+    edc_match_mode: Optional[Literal["exact", "prefix"]] = "prefix"
+    edc_exclude_like: Optional[str] = "%-backup"
 
 
 class TaskBatchDelete(BaseModel):

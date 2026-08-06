@@ -591,7 +591,8 @@
               <option value="succeeded">succeeded</option>
               <option value="failed">failed</option>
             </select>
-            <input type="month" v-model="runsQuery.month" />
+            <label class="hint">执行月份 <input type="month" v-model="runsQuery.month" /></label>
+            <label class="hint">数据月份 <input type="month" v-model="runsQuery.data_month" /></label>
             <select v-model="runsQuery.task_kind">
               <option value="all">全部任务类型</option>
               <option value="periodic">仅周期性</option>
@@ -633,6 +634,10 @@
                 <div class="item-sub" v-if="r.progress_stage">
                   进度：{{ r.progress_pct || 0 }}% · {{ r.progress_stage }}
                 </div>
+                <div class="item-sub" v-if="r.edc_match">
+                  EDC匹配：{{ r.edc_match.matched_count || 0 }} 个对象 · {{ r.edc_match.window_start }} ~ {{ r.edc_match.window_end }}
+                  <span v-if="r.edc_match.match_hash" class="hint">hash={{ r.edc_match.match_hash.slice(0, 10) }}</span>
+                </div>
                 <div class="item-sub" v-if="runEndReason(r)">
                   结束原因：{{ runEndReasonText(r) }}
                 </div>
@@ -658,6 +663,7 @@
               </div>
               <div class="actions">
                 <button class="btn-muted" @click="viewRunLog(r)">查看日志</button>
+                <button v-if="r.edc_match" class="btn-muted" @click="viewEdcMatch(r)">匹配对象</button>
                 <a class="btn-muted" :href="'/api/jobs/' + r.id + '/log'" target="_blank">下载日志</a>
                 <button class="btn-danger" @click="deleteRun(r.id)">删除</button>
               </div>
@@ -681,6 +687,22 @@
         </div>
       </section>
     </div>
+
+    <section v-if="matchViewer.visible" class="edit-panel">
+      <h2>EDC 匹配快照</h2>
+      <div class="row"><button class="btn-muted" @click="closeMatchViewer">关闭</button></div>
+      <div class="meta-text" v-if="matchViewer.loading">匹配快照加载中...</div>
+      <div class="meta-text" v-if="matchViewer.error">加载失败：{{ matchViewer.error }}</div>
+      <div v-if="matchViewer.data && !matchViewer.loading">
+        <div class="item-sub">窗口：{{ matchViewer.data.window_start }} ~ {{ matchViewer.data.window_end }}</div>
+        <div class="item-sub">表达式：{{ matchViewer.data.edc_name_expression }}，模式：{{ matchViewer.data.match_mode }}，排除：{{ matchViewer.data.exclude_like || '无' }}</div>
+        <div class="item-sub">对象数：{{ matchViewer.data.matched_count }}，集合哈希：{{ matchViewer.data.match_hash || '-' }}</div>
+        <div class="artifact-list" v-if="matchViewer.data.items && matchViewer.data.items.length">
+          <div v-for="it in matchViewer.data.items" :key="it.edc_name">{{ it.edc_name }} <span class="hint">({{ it.match_operator || '-' }} {{ it.effective_pattern || it.matched_by || '-' }})</span></div>
+        </div>
+        <div class="meta-text" v-else>该窗口没有匹配对象。</div>
+      </div>
+    </section>
 
     <section v-if="logViewer.visible" class="edit-panel">
       <h2>运行日志 #{{ logViewer.jobId }}</h2>

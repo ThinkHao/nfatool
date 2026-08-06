@@ -32,7 +32,7 @@ createApp({
       downloadPreview: { matched_runs: 0, matched_files: 0 },
       runsFilterTaskId: null,
       tasksQuery: { q: '', task_kind: 'all', task_group: '', sort_by: 'id', sort_order: 'desc' },
-      runsQuery: { status: '', sort_by: 'started_at', sort_order: 'desc', month: '', task_kind: 'all', file_format: 'csv' },
+      runsQuery: { status: '', sort_by: 'started_at', sort_order: 'desc', month: '', data_month: '', task_kind: 'all', file_format: 'csv' },
       tasksPageJump: 1,
       runsPageJump: 1,
       dataSourceCatalog: { nfa: ['default'], edc: [] },
@@ -93,7 +93,8 @@ createApp({
         output_filename_template: ''
       },
       editTask: null,
-      logViewer: { visible: false, jobId: '', content: '', loading: false, error: '' }
+      logViewer: { visible: false, jobId: '', content: '', loading: false, error: '' },
+      matchViewer: { visible: false, loading: false, error: '', data: null }
     }
   },
   methods: {
@@ -1037,6 +1038,7 @@ createApp({
       if (this.runsFilterTaskId != null) params.set('task_id', String(this.runsFilterTaskId))
       if (this.runsQuery && this.runsQuery.status) params.set('status', this.runsQuery.status)
       if (this.runsQuery && this.runsQuery.month) params.set('month', this.runsQuery.month)
+      if (this.runsQuery && this.runsQuery.data_month) params.set('data_month', this.runsQuery.data_month)
       if (this.runsQuery && this.runsQuery.task_kind && this.runsQuery.task_kind !== 'all') params.set('task_kind', this.runsQuery.task_kind)
       if (this.runsQuery && this.runsQuery.sort_by) params.set('sort_by', this.runsQuery.sort_by)
       if (this.runsQuery && this.runsQuery.sort_order) params.set('sort_order', this.runsQuery.sort_order)
@@ -1067,6 +1069,7 @@ createApp({
       this.runsFilterTaskId = null
       this.runsQuery.status = ''
       this.runsQuery.month = ''
+      this.runsQuery.data_month = ''
       this.runsQuery.task_kind = 'all'
       this.downloadPreview = { matched_runs: 0, matched_files: 0 }
       this.loadRunsPage(1, this.runsPage.page_size)
@@ -1183,6 +1186,26 @@ createApp({
     },
     closeLogViewer() {
       this.logViewer = { visible: false, jobId: '', content: '', loading: false, error: '' }
+    },
+    async viewEdcMatch(run) {
+      if (!run || !run.id) return
+      this.matchViewer = { visible: true, loading: true, error: '', data: null }
+      try {
+        const res = await apiFetch('/api/jobs/' + encodeURIComponent(run.id) + '/edc-match', {}, this.apiKey)
+        if (!res.ok) {
+          this.matchViewer.loading = false
+          this.matchViewer.error = await this.extractApiError(res, '加载匹配快照失败')
+          return
+        }
+        this.matchViewer.data = await res.json()
+        this.matchViewer.loading = false
+      } catch (e) {
+        this.matchViewer.loading = false
+        this.matchViewer.error = String(e)
+      }
+    },
+    closeMatchViewer() {
+      this.matchViewer = { visible: false, loading: false, error: '', data: null }
     },
     taskChecked(id) {
       return this.selectedTaskIds.includes(Number(id))

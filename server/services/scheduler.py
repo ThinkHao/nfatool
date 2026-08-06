@@ -313,6 +313,9 @@ def create_job_run_from_task(task_id: int) -> str:
         resolved_params = dict(params)
         resolved_params.setdefault("data_source_type", task.data_source_type or "nfa")
         resolved_params.setdefault("data_source_instance", task.data_source_instance or "default")
+        # Internal provenance used when persisting an EDC match snapshot.
+        resolved_params["_task_id"] = task.id
+        resolved_params["_task_name_snapshot"] = task.name
         run = JobRun(
             id=job_id,
             task_id=task.id,

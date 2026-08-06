@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, Integer, Boolean, Text, DateTime, ForeignKey
+from sqlalchemy import String, Integer, Boolean, Text, DateTime, ForeignKey, UniqueConstraint, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -75,3 +75,45 @@ class JobRun(Base):
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     task: Mapped[Optional[Task]] = relationship("Task", back_populates="runs")
+
+
+class EdcMatchSnapshot(Base):
+    """Frozen EDC object set used by one run."""
+
+    __tablename__ = "edc_match_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_run_id: Mapped[str] = mapped_column(String(36), ForeignKey("job_runs.id"), unique=True, index=True)
+    task_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    task_name_snapshot: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    data_source_instance: Mapped[str] = mapped_column(String(100), default="default")
+    window_start: Mapped[str] = mapped_column(String(32))
+    window_end: Mapped[str] = mapped_column(String(32))
+    edc_name_expression: Mapped[str] = mapped_column(Text)
+    match_mode: Mapped[str] = mapped_column(String(20), default="prefix")
+    exclude_like: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    matched_count: Mapped[int] = mapped_column(Integer, default=0)
+    match_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="resolved")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    source_config_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    items: Mapped[list[EdcMatchSnapshotItem]] = relationship(
+        "EdcMatchSnapshotItem", back_populates="snapshot", cascade="all, delete-orphan", order_by="EdcMatchSnapshotItem.edc_name"
+    )
+
+
+class EdcMatchSnapshotItem(Base):
+    __tablename__ = "edc_match_snapshot_items"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id: Mapped[int] = mapped_column(ForeignKey("edc_match_snapshots.id"), index=True)
+    edc_name: Mapped[str] = mapped_column(String(255))
+    matched_by: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    match_operator: Mapped[Optional[str]] = mapped_column(String(10), nullable=True)
+    effective_pattern: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    snapshot: Mapped[EdcMatchSnapshot] = relationship("EdcMatchSnapshot", back_populates="items")
+
+    __table_args__ = (UniqueConstraint("snapshot_id", "edc_name", name="uq_edc_snapshot_item_name"),)
