@@ -342,6 +342,38 @@ def _query_edc_window(
         return list(cursor.fetchall() or [])
 
 
+def _query_edc_raw_window(
+    conn,
+    table_name: str,
+    time_col: str,
+    name_col: str,
+    value_col: str,
+    edc_name: str,
+    start_s: str,
+    end_s: str,
+    wildcard_mode: str,
+    exclude_like: str | None,
+) -> list[dict]:
+    """Return one row per source EDC record without percentile aggregation."""
+    name_frag, name_args = _edc_name_predicate(name_col, edc_name, wildcard_mode)
+    where = [name_frag, f"{time_col} >= %s", f"{time_col} <= %s"]
+    args: list[Any] = [*name_args, start_s, end_s]
+    if exclude_like:
+        where.append(f"{name_col} NOT LIKE %s")
+        args.append(exclude_like)
+    sql = f"""
+        SELECT {time_col} AS create_time,
+               {name_col} AS edc_name,
+               {value_col} AS service_size
+        FROM {table_name}
+        WHERE {" AND ".join(where)}
+        ORDER BY {time_col}, {name_col}
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(sql, tuple(args))
+        return list(cursor.fetchall() or [])
+
+
 def _pick_daily_95_from_rows(rows: list[dict], rank_index: int) -> tuple[float, int]:
     if not rows:
         return 0.0, 0
@@ -525,6 +557,7 @@ def _compute_edc_and_export(
     if "edc_exclude_like" in params:
         exclude_like = params.get("edc_exclude_like")
     rank_index = int(params.get("edc_rank_index", cfg.get("daily_rank_index", 14)))
+    export_raw = bool(params.get("export_raw", False))
     export_daily = bool(params.get("export_daily", False))
     monthly_aggregate = bool(params.get("monthly_aggregate", False))
     settlement_mode = str(params.get("settlement_mode") or "range_95")
@@ -562,6 +595,36 @@ def _compute_edc_and_export(
                 resolved_window=resolved_window,
                 key_params={"edc_name": edc_name, "wildcard_mode": wildcard_mode, "exclude_like": exclude_like},
                 counters={"matched_objects": 0},
+            )
+        if export_raw:
+            _progress(progress_cb, 25, "EDC: 正在查询原始数据")
+            raw_rows = _query_edc_raw_window(
+                conn, table_name, time_col, name_col, value_col, effective_edc_name,
+                f"{start_time}", f"{end_time}", effective_match_mode, exclude_like,
+            )
+            df_raw = pd.DataFrame(raw_rows)
+            if not df_raw.empty:
+                df_raw["data_source_type"] = "edc"
+                df_raw["data_source_instance"] = source_instance
+                df_raw["requested_edc_name"] = edc_name
+                df_raw["unit_base"] = unit_base
+                if "create_time" in df_raw.columns:
+                    df_raw = df_raw.sort_values(by=["create_time", "edc_name"], kind="stable")
+            _progress(progress_cb, 92, "EDC: 正在导出原始数据产物")
+            return _export_df(
+                df_raw,
+                job_id,
+                f"{base_name}-raw",
+                export_formats,
+                empty_terminal={
+                    "reason": f"EDC 原始数据为空：模式={edc_name}，窗口={window_label}",
+                    "source_type": "edc",
+                    "source_instance": source_instance,
+                    "resolved_window": resolved_window,
+                    "key_params": {"edc_name": edc_name, "export_raw": True},
+                    "counters": {"matched_objects": len(frozen_names), "raw_rows": 0},
+                },
+                flow_context={"source_type": "edc", "unit_base": unit_base, "raw_export": True},
             )
         st = pd.to_datetime(start_time)
         et = pd.to_datetime(end_time)
@@ -824,6 +887,91 @@ def _to_dataframe(results: List[Dict[str, Any]]) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
+def _nfa_raw_dataframe(
+    conn,
+    schools: List[Dict[str, Any]],
+    start_time: str,
+    end_time: str,
+    *,
+    batch_size: int,
+    combine_v4_v6: bool,
+    merge_key: str | None,
+    aggregate_all: bool = False,
+    aggregate_label: str = "全部院校汇总",
+) -> pd.DataFrame:
+    """Fetch NFA raw points and apply only the requested identity aggregation."""
+    df = c95.fetch_speed_data_for_pairs_raw(
+        conn, schools, pd.to_datetime(start_time), pd.to_datetime(end_time), batch_size=batch_size
+    )
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["create_time"] = pd.to_datetime(out["create_time"])
+    for col in ("recv", "send"):
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    if aggregate_all:
+        out = out.groupby("create_time", as_index=False)[["recv", "send"]].sum()
+        out["ipgroup_name"] = aggregate_label
+        out["school_name"] = aggregate_label
+        out["ipgroup_id"] = ""
+        out["nfa_uuid"] = ""
+        out["hash_uuid"] = ""
+    else:
+        info_map = {
+            (s.get("ipgroup_id"), s.get("nfa_uuid")): s
+            for s in schools
+        }
+        if combine_v4_v6:
+            key = (merge_key or "ipgroup_name_base").strip().lower()
+
+            def _base_name(value: Any) -> str:
+                name = str(value or "").strip()
+                if name.lower().endswith(("_v4", "_v6")):
+                    return name[:-3]
+                return name
+
+            def _merge_value(meta: Dict[str, Any]) -> tuple[str, str]:
+                if key == "school_id":
+                    value = meta.get("school_id")
+                    return str(value or ""), str(meta.get("ipgroup_name") or meta.get("school_name") or value or "")
+                if key == "school_name_plus_cp":
+                    value = f"{str(meta.get('school_name') or '').strip()}_{str(meta.get('cp') or '').strip()}".strip("_")
+                    return value, value
+                if key == "school_name":
+                    value = str(meta.get("school_name") or "").strip()
+                    return value, value
+                if key == "ipgroup_name":
+                    value = str(meta.get("ipgroup_name") or meta.get("school_name") or "").strip()
+                    return value, value
+                value = _base_name(meta.get("ipgroup_name") or meta.get("school_name"))
+                return value, value
+
+            merge_map = {
+                pair: _merge_value(meta)
+                for pair, meta in info_map.items()
+            }
+            out[["_merge_value", "ipgroup_name"]] = out.apply(
+                lambda row: pd.Series(merge_map.get((row.get("ipgroup_id"), row.get("nfa_uuid")), ("", ""))),
+                axis=1,
+            )
+            out = out.groupby(["_merge_value", "ipgroup_name", "create_time"], as_index=False)[["recv", "send"]].sum()
+            out["school_name"] = out["ipgroup_name"]
+            out["ipgroup_id"] = ""
+            out["nfa_uuid"] = ""
+            out["hash_uuid"] = ""
+            out = out.drop(columns=["_merge_value"], errors="ignore")
+        else:
+            meta_df = pd.DataFrame(list(info_map.values()))
+            keep = [c for c in ("ipgroup_id", "nfa_uuid", "hash_uuid", "ipgroup_name", "school_name", "school_id", "region", "cp", "saler_group", "saler") if c in meta_df.columns]
+            if keep:
+                out = out.merge(meta_df[keep].drop_duplicates(["ipgroup_id", "nfa_uuid"]), on=["ipgroup_id", "nfa_uuid"], how="left")
+
+    out["direction"] = "both"
+    return out.sort_values(by=["create_time"], kind="stable").reset_index(drop=True)
+
+
 def _progress(progress_cb: Callable[[int, str], None] | None, pct: int, stage: str) -> None:
     if not progress_cb:
         return
@@ -955,6 +1103,25 @@ def _normalize_flow_columns_for_export(
     return out
 
 
+def _normalize_raw_columns_for_export(
+    df: pd.DataFrame,
+    flow_context: Dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Add source-specific Mbps columns while preserving raw point values."""
+    if df is None or df.empty:
+        return df
+    ctx = flow_context or {}
+    source_type = str(ctx.get("source_type") or "nfa").strip().lower()
+    seconds_per_point = 300.0 if source_type == "edc" else 60.0
+    out = df.copy()
+    raw_columns = [c for c in ("service_size", "recv", "send") if c in out.columns]
+    for col in raw_columns:
+        values = pd.to_numeric(out[col], errors="coerce")
+        out[f"{col}_mbps_1000"] = values * 8 / seconds_per_point / 1000.0 / 1000.0
+        out[f"{col}_mbps_1024"] = values * 8 / seconds_per_point / 1024.0 / 1024.0
+    return out
+
+
 def _apply_default_export_sort(
     df: pd.DataFrame,
     flow_context: Dict[str, Any] | None = None,
@@ -1059,7 +1226,10 @@ def _export_df(
         )
         return artifacts
     df = _apply_default_export_sort(df, flow_context=flow_context)
-    df = _normalize_flow_columns_for_export(df, flow_context=flow_context)
+    if bool((flow_context or {}).get("raw_export")):
+        df = _normalize_raw_columns_for_export(df, flow_context=flow_context)
+    else:
+        df = _normalize_flow_columns_for_export(df, flow_context=flow_context)
     if "csv" in export_formats:
         p = safe_artifact_path(job_id, f"{filename_noext}.csv")
         export_csv(df, p)
@@ -1181,6 +1351,7 @@ def compute_and_export(
     sortby = params.get("sortby")
     sort_order = params.get("sort_order", "desc")
     aggregate_all = bool(params.get("aggregate_all", False))
+    export_raw = bool(params.get("export_raw", False))
     batch_size = int(params.get("batch_size", 200))
 
     # New params
@@ -1364,6 +1535,92 @@ def compute_and_export(
                     extras=dict(diag_context),
                 )
             _progress(progress_cb, 11, f"NFA: 窗口内有数据对象 {len(schools)}/{len(pairs_all)}")
+
+        if export_raw:
+            try:
+                _progress(progress_cb, 25, "NFA: 正在查询原始数据")
+                raw_context = {
+                    "source_type": "nfa",
+                    "unit_base": unit_base,
+                    "raw_export": True,
+                    "combine_v4_v6": combine_v4_v6,
+                }
+
+                def _prepare_raw(df_raw: pd.DataFrame) -> pd.DataFrame:
+                    if df_raw is None or df_raw.empty:
+                        return pd.DataFrame()
+                    df_out = df_raw.copy()
+                    df_out["data_source_type"] = "nfa"
+                    df_out["data_source_instance"] = source_instance
+                    df_out["unit_base"] = unit_base
+                    df_out["direction"] = direction
+                    return df_out
+
+                if exclude_school:
+                    exclude_set = {x.strip() for x in str(exclude_school).split(",") if x.strip()}
+                    excluded_schools = [s for s in schools if s.get("school_name") in exclude_set]
+                    remaining_schools = [s for s in schools if s.get("school_name") not in exclude_set]
+                    if excluded_schools:
+                        df_excluded = _prepare_raw(_nfa_raw_dataframe(
+                            conn, excluded_schools, start_time, end_time,
+                            batch_size=batch_size, combine_v4_v6=combine_v4_v6, merge_key=merge_key,
+                        ))
+                        artifacts += _export_df(
+                            df_excluded, job_id, f"{base_name}_excluded-raw", export_formats,
+                            empty_terminal=_nfa_empty_terminal(
+                                f"NFA 原始排除组结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                                {"excluded_schools": len(excluded_schools), "export_raw": True},
+                            ),
+                            flow_context=raw_context,
+                        )
+                    if remaining_schools:
+                        from collections import Counter
+                        names = [str(s.get("ipgroup_name") or s.get("school_name") or "").strip() for s in remaining_schools]
+                        names = [n for n in names if n]
+                        names_txt = safe_artifact_path(job_id, f"{base_name}_remaining_names.txt")
+                        counts = Counter(names)
+                        names_txt.write_text(
+                            "".join(f"{n} x{c}\n" if c > 1 else f"{n}\n" for n, c in sorted(counts.items())),
+                            encoding="utf-8",
+                        )
+                        artifacts.append({"filename": names_txt.name, "size": names_txt.stat().st_size, "path": str(names_txt)})
+                        df_remaining = _prepare_raw(_nfa_raw_dataframe(
+                            conn, remaining_schools, start_time, end_time,
+                            batch_size=batch_size, combine_v4_v6=combine_v4_v6, merge_key=merge_key,
+                            aggregate_all=True, aggregate_label="剩余院校汇总",
+                        ))
+                        artifacts += _export_df(
+                            df_remaining, job_id, f"{base_name}_remaining-raw", export_formats,
+                            empty_terminal=_nfa_empty_terminal(
+                                f"NFA 原始剩余组结果为空：省份={province}，CP={cp}，窗口={window_label}",
+                                {"remaining_schools": len(remaining_schools), "export_raw": True},
+                            ),
+                            flow_context=raw_context,
+                        )
+                else:
+                    df_raw = _prepare_raw(_nfa_raw_dataframe(
+                        conn, schools, start_time, end_time,
+                        batch_size=batch_size, combine_v4_v6=combine_v4_v6, merge_key=merge_key,
+                        aggregate_all=aggregate_all,
+                    ))
+                    artifacts += _export_df(
+                        df_raw, job_id, f"{base_name}-raw", export_formats,
+                        empty_terminal=_nfa_empty_terminal(
+                            f"NFA 原始数据为空：省份={province}，CP={cp}，窗口={window_label}",
+                            {"matched_schools": len(schools), "aggregate_all": aggregate_all, "export_raw": True},
+                        ),
+                        flow_context=raw_context,
+                    )
+                _progress(progress_cb, 92, "NFA: 正在导出原始数据产物")
+                return artifacts
+            except c95.NfaBatchQueryError as e:
+                diag_context["query_elapsed_ms"] = None
+                return _nfa_query_failure(
+                    f"NFA 原始数据查询失败：{e.original_exception}。窗口={window_label}",
+                    filename_noext=f"{base_name}-raw",
+                    counters={"matched_schools": len(schools)},
+                    exc=e,
+                )
 
         # Helper: split [start_time, end_time] into calendar months
         def _month_ranges(start_s: str, end_s: str):

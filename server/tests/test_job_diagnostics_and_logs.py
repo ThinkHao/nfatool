@@ -25,7 +25,7 @@ if "paramiko" not in sys.modules:
     sys.modules["paramiko"] = paramiko_stub
 
 from server.services import compute95
-from server.services.compute95 import _export_df, _make_terminal_no_data_artifacts
+from server.services.compute95 import _export_df, _make_terminal_no_data_artifacts, _nfa_raw_dataframe
 from server.services.unit_conversion import mbps_to_raw
 from server.ext.calculate_95th_percentile import save_results
 
@@ -108,6 +108,59 @@ def test_export_df_empty_adds_empty_result_diagnostics(monkeypatch, tmp_path):
     assert "empty-demo-diagnostics.json" in names
     marker = next(x for x in artifacts if x["filename"].endswith("-empty_result.txt"))
     assert marker["terminal_code"] == "EMPTY_RESULT"
+
+
+def test_export_df_raw_adds_both_source_unit_conversions(monkeypatch, tmp_path):
+    import server.config as config
+
+    monkeypatch.setenv("STORAGE_DIR", str(tmp_path / "storage"))
+    config.get_settings.cache_clear()
+
+    df = pd.DataFrame([{"create_time": "2026-01-01 00:00:00", "recv": 60_000_000, "send": 30_000_000}])
+    artifacts = _export_df(
+        df,
+        "job-raw",
+        "nfa-raw",
+        ["csv"],
+        flow_context={"source_type": "nfa", "unit_base": 1024, "raw_export": True},
+    )
+    csv_path = next(x["path"] for x in artifacts if x["filename"].endswith(".csv"))
+    out_df = pd.read_csv(csv_path)
+
+    assert out_df.loc[0, "recv"] == 60_000_000
+    assert out_df.loc[0, "recv_mbps_1000"] == pytest.approx(8.0)
+    assert out_df.loc[0, "recv_mbps_1024"] == pytest.approx(7.62939453125)
+    assert "send_mbps_1000" in out_df.columns
+    assert "send_mbps_1024" in out_df.columns
+
+
+def test_nfa_raw_dataframe_preserves_rows_and_merges_metadata(monkeypatch):
+    raw = pd.DataFrame([
+        {"ipgroup_id": 1, "nfa_uuid": "u1", "create_time": "2026-01-01 00:00:00", "recv": 10, "send": 2},
+        {"ipgroup_id": 2, "nfa_uuid": "u2", "create_time": "2026-01-01 00:00:00", "recv": 20, "send": 3},
+    ])
+    monkeypatch.setattr(compute95.c95, "fetch_speed_data_for_pairs_raw", lambda *args, **kwargs: raw.copy())
+    schools = [
+        {"ipgroup_id": 1, "nfa_uuid": "u1", "hash_uuid": "h1", "ipgroup_name": "A_V4", "school_name": "A"},
+        {"ipgroup_id": 2, "nfa_uuid": "u2", "hash_uuid": "h2", "ipgroup_name": "A_V6", "school_name": "A"},
+    ]
+
+    out = _nfa_raw_dataframe(
+        object(), schools, "2026-01-01 00:00:00", "2026-01-01 00:05:00",
+        batch_size=200, combine_v4_v6=False, merge_key=None,
+    )
+    assert len(out) == 2
+    assert set(out["ipgroup_name"]) == {"A_V4", "A_V6"}
+    assert set(out["hash_uuid"]) == {"h1", "h2"}
+
+    merged = _nfa_raw_dataframe(
+        object(), schools, "2026-01-01 00:00:00", "2026-01-01 00:05:00",
+        batch_size=200, combine_v4_v6=True, merge_key="ipgroup_name_base",
+    )
+    assert len(merged) == 1
+    assert merged.loc[0, "ipgroup_name"] == "A"
+    assert merged.loc[0, "recv"] == 30
+    assert merged.loc[0, "send"] == 5
 
 
 def test_export_df_nfa_daily_formats_flow_and_adds_raw_column(monkeypatch, tmp_path):

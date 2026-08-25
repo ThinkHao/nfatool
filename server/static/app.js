@@ -88,7 +88,7 @@ createApp({
         timezone: 'Asia/Shanghai',
         window_selector: 'custom',
         window_params: {},
-        params: { direction: 'both', export_daily: false, sortby: '', sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, merge_key: '', batch_size: 200, school: '', exclude_school: '', unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300, edc_name: '', edc_match_mode: 'prefix' },
+        params: { direction: 'both', export_raw: false, export_daily: false, sortby: '', sort_order: 'desc', aggregate_all: false, combine_v4_v6: false, merge_key: '', batch_size: 200, school: '', exclude_school: '', unit_base: 1024, settlement_mode: 'range_95', monthly_aggregate: false, data_budget_enabled: false, data_budget_mul: 8, data_budget_div: 300, edc_name: '', edc_match_mode: 'prefix' },
         export_formats: ['csv'],
         output_filename_template: ''
       },
@@ -586,9 +586,18 @@ createApp({
         p.merge_key = ''
       }
     },
+    onRawExportToggle(obj) {
+      if (!obj || !obj.params) return
+      obj.params.export_raw = !!obj.params.export_raw
+      if (obj.params.export_raw) {
+        obj.params.export_daily = false
+        obj.params.monthly_aggregate = false
+      }
+    },
     defaultTaskParams() {
       return {
         direction: 'both',
+        export_raw: false,
         export_daily: false,
         sortby: '',
         sort_order: 'desc',
@@ -622,6 +631,11 @@ createApp({
       if (p.batch_size == null || p.batch_size === '') p.batch_size = 200
       p.export_daily = !!p.export_daily
       p.monthly_aggregate = !!p.monthly_aggregate
+      p.export_raw = !!p.export_raw
+      if (p.export_raw) {
+        p.export_daily = false
+        p.monthly_aggregate = false
+      }
       if (st === 'edc') {
         p.direction = 'both'
         p.aggregate_all = false

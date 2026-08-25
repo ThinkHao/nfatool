@@ -312,12 +312,13 @@
             <option :value="1024">单位换算 1024</option>
             <option :value="1000">单位换算 1000</option>
           </select>
-          <select v-model="newTask.params.settlement_mode">
+          <select v-model="newTask.params.settlement_mode" :disabled="newTask.params.export_raw">
             <option value="range_95">结算方式：月95</option>
             <option value="daily_95_avg">结算方式：日95平均</option>
           </select>
-          <label><input type="checkbox" v-model="newTask.params.export_daily" /> 导出每日</label>
-          <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" /> 按月聚合导出</label>
+          <label><input type="checkbox" v-model="newTask.params.export_raw" @change="onRawExportToggle(newTask)" /> 导出原始数据</label>
+          <label><input type="checkbox" v-model="newTask.params.export_daily" :disabled="newTask.params.export_raw" /> 导出每日</label>
+          <label><input type="checkbox" v-model="newTask.params.monthly_aggregate" :disabled="newTask.params.export_raw" /> 按月聚合导出</label>
 
           <template v-if="newTask.data_source_type==='nfa'">
             <label><input type="checkbox" v-model="newTask.params.combine_v4_v6" @change="onCombineV4V6Toggle(newTask)" /> V4/V6累加</label>
@@ -429,12 +430,13 @@
           <option :value="1024">单位换算 1024</option>
           <option :value="1000">单位换算 1000</option>
         </select>
-        <select v-model="editTask.params.settlement_mode">
+        <select v-model="editTask.params.settlement_mode" :disabled="editTask.params.export_raw">
           <option value="range_95">结算方式：月95</option>
           <option value="daily_95_avg">结算方式：日95平均</option>
         </select>
-        <label><input type="checkbox" v-model="editTask.params.export_daily" /> 导出每日</label>
-        <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" /> 按月聚合导出</label>
+        <label><input type="checkbox" v-model="editTask.params.export_raw" @change="onRawExportToggle(editTask)" /> 导出原始数据</label>
+        <label><input type="checkbox" v-model="editTask.params.export_daily" :disabled="editTask.params.export_raw" /> 导出每日</label>
+        <label><input type="checkbox" v-model="editTask.params.monthly_aggregate" :disabled="editTask.params.export_raw" /> 按月聚合导出</label>
 
         <template v-if="editTask.data_source_type==='nfa'">
           <label><input type="checkbox" v-model="editTask.params.combine_v4_v6" @change="onCombineV4V6Toggle(editTask)" /> V4/V6累加</label>
